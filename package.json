@@ -1,0 +1,15 @@
+{
+  "name": "pi-ssh-readonly",
+  "version": "0.1.0",
+  "description": "SSH read-only mode extension for pi.",
+  "keywords": ["pi-package", "pi", "ssh", "readonly"],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  }
+}
