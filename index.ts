@@ -15,9 +15,9 @@ const DEFAULT_LINE_LIMIT = 2000;
 const DEFAULT_BYTE_LIMIT = 50 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DENIED_DIR_NAMES = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".terraform", ".terraform.d", ".cloudflared", ".cloudflare", ".password-store"];
-const DENIED_PATH_PARTS = ["/.config/gcloud", "/.config/gh", "/.gem/credentials", "/.cargo/credentials"];
-const DENIED_FILE_NAMES = [".env", ".netrc", ".npmrc", ".pypirc", ".gitconfig", ".git-credentials", "terraform.tfstate", ".bash_history", ".zsh_history", ".fish_history", ".sh_history", ".ash_history", ".history", ".mysql_history", ".psql_history", ".sqlite_history", ".python_history", ".rediscli_history", ".lesshst", ".wget-hsts"];
-const DENIED_FILE_SUFFIXES = [".pem", ".key", ".p12", ".pfx"];
+const DENIED_PATH_PARTS = ["/.config/gcloud", "/.config/gh", "/.config/Bitwarden CLI", "/.config/Bitwarden", "/.config/bitwarden", "/.config/1Password", "/.config/op", "/.config/keepassxc", "/.config/KeePass", "/.config/keepass", "/.config/gopass", "/.local/share/fish", "/.local/share/nano", "/.local/share/keepassxc", "/.local/share/gopass", "/.gem/credentials", "/.cargo/credentials"];
+const DENIED_FILE_NAMES = [".env", ".netrc", ".npmrc", ".pypirc", ".gitconfig", ".git-credentials", "terraform.tfstate", ".bash_history", ".zsh_history", ".zhistory", ".fish_history", "fish_history", ".sh_history", ".ash_history", ".history", "search_history", ".mysql_history", ".psql_history", ".sqlite_history", ".python_history", ".node_repl_history", ".rediscli_history", ".lesshst", ".wget-hsts"];
+const DENIED_FILE_SUFFIXES = [".pem", ".key", ".p12", ".pfx", "_history"];
 const DENIED_FILE_PREFIXES = [".env.", "terraform.tfstate."];
 
 let state: SshRoState = { active: false };
@@ -87,11 +87,18 @@ function assertPathAllowed(path: string): void {
 	if (reason) throw new Error(`SSH Read-only Mode blocks this path by default: ${reason}`);
 }
 
-function findDenyExpression(): string {
+function findDenyPredicates(): string {
 	const dirPrunes = [...DENIED_DIR_NAMES, ".git", "node_modules"].map((name) => `-name ${shellQuote(name)}`).join(" -o ");
 	const pathPrunes = DENIED_PATH_PARTS.map((part) => `-path ${shellQuote(`*${part}`)}`).join(" -o ");
-	const allPrunes = [dirPrunes, pathPrunes].filter(Boolean).join(" -o ");
-	return `\\( ${allPrunes} \\) -prune -o `;
+	return [dirPrunes, pathPrunes].filter(Boolean).join(" -o ");
+}
+
+function findDenyExpression(): string {
+	return `\\( ${findDenyPredicates()} \\) -prune -o `;
+}
+
+function findMarkedDenyExpression(matchPredicate: string): string {
+	return `\\( ${findDenyPredicates()} \\) \\( ${matchPredicate} -print -o -true \\) -prune -o `;
 }
 
 function findFileDenyPredicates(): string {
@@ -183,8 +190,12 @@ function joinRemotePath(parent: string, child: string): string {
 	return normalizeRemotePathForPolicy(`${parent.replace(/\/+$/, "")}/${child}`);
 }
 
+function appendBlockedFootnote(output: string): string {
+	return output.includes(" [blocked]") ? `${output}\n\n[blocked] = content access is blocked by SSH Read-only Mode credential/history guardrails; ask the user to inspect manually if needed.` : output;
+}
+
 function markBlockedLsEntries(output: string, listedPath: string): string {
-	return output
+	const marked = output
 		.split("\n")
 		.map((line) => {
 			if (!line || line.startsWith("total ") || line.startsWith("[stderr]")) return line;
@@ -192,10 +203,21 @@ function markBlockedLsEntries(output: string, listedPath: string): string {
 			if (!match) return line;
 			const name = match[2].split(" -> ", 1)[0];
 			if (name === "." || name === "..") return line;
-			const reason = denyReasonForPath(joinRemotePath(listedPath, name));
-			return reason ? `${line} [ssh-ro blocked: ${reason}]` : line;
+			return denyReasonForPath(joinRemotePath(listedPath, name)) ? `${line} [blocked]` : line;
 		})
 		.join("\n");
+	return appendBlockedFootnote(marked);
+}
+
+function markBlockedFindEntries(output: string): string {
+	const marked = output
+		.split("\n")
+		.map((line) => {
+			if (!line.trim() || line.startsWith("find:")) return line;
+			return denyReasonForPath(line.trim()) ? `${line} [blocked]` : line;
+		})
+		.join("\n");
+	return appendBlockedFootnote(marked);
 }
 
 function psHasOnlyHeader(output: string): boolean {
@@ -344,13 +366,13 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 500)));
 				const pathPattern = params.pattern.includes("/") && !params.pattern.startsWith("/") ? `*/${params.pattern}` : params.pattern;
 				const pred = params.pattern.includes("/") ? `-path ${shellQuote(pathPattern)}` : `-name ${shellQuote(params.pattern)}`;
-				assertPathAllowed(base);
+				if (denyReasonForPath(base)) return textResult(appendBlockedFootnote(`${base} [blocked]`));
 				const shouldPrune = !base.includes("/.git") && !base.includes("/node_modules") && !denyReasonForPath(`${base}/placeholder`);
-				const prune = shouldPrune ? findDenyExpression() : "";
-				const fileDeny = findFileDenyPredicates();
-				const script = `find ${shellQuote(base)} ${prune}${pred} ${fileDeny} -print 2>&1 | sed -n '1,${limit}p'`;
+				const prune = shouldPrune ? findMarkedDenyExpression(pred) : "";
+				const script = `find ${shellQuote(base)} ${prune}${pred} -print 2>&1 | sed -n '1,${limit}p'`;
 				const r = await sshExec(target, script, signal, 45_000);
-				return textResult(truncateText(r.stdout + r.stderr, limit), r.code !== 0 && r.stdout.trim().length === 0);
+				const output = markBlockedFindEntries(r.stdout + r.stderr);
+				return textResult(output.trim().length ? truncateText(output, limit) : "No matches", r.code !== 0 && r.stdout.trim().length === 0);
 			} catch (err) {
 				return textResult(err instanceof Error ? err.message : String(err), true);
 			}
@@ -516,8 +538,10 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const script = `command -v ss >/dev/null 2>&1 || { echo 'ss not found on remote host' >&2; exit 127; }; ss ${flags} 2>&1 | sed -n '1,${limit}p'`;
 				const r = await sshExec(target, script, signal, 20_000);
 				let output = r.stdout + r.stderr;
-				if (params.processInfo && output.trim().length > 0 && !output.includes("users:(")) {
-					output += "\n[ssh-ro note] processInfo=true was requested, but no process ownership details were visible. This usually means the SSH user lacks permission to inspect socket owners.\n";
+				if (params.processInfo && output.trim().length > 0) {
+					output += output.includes("users:(")
+						? "\n[ssh-ro note] processInfo=true was requested; process ownership details may still be partial without elevated privileges.\n"
+						: "\n[ssh-ro note] processInfo=true was requested, but no process ownership details were visible. This usually means the SSH user lacks permission to inspect socket owners.\n";
 				}
 				return textResult(output.trim().length ? truncateText(output, limit) : "No socket output", r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
@@ -607,7 +631,7 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 		const localCwd = process.cwd();
 		const remoteLine = `Current working directory: ${state.remoteCwd} (SSH Read-only Mode target: ${state.target})`;
 		let systemPrompt = event.systemPrompt.replace(`Current working directory: ${localCwd}`, remoteLine);
-		systemPrompt += `\n\nSSH Read-only Mode is active for ${state.target}. Remote working directory: ${state.remoteCwd}. Paths are resolved on the remote host; relative paths resolve from that remote working directory. The sshro_* tools operate on the remote host. Tilde expansion is not supported. The tools apply best-effort credential guardrails: common credential directories/files are blocked for direct access, and recursive sshro_find and sshro_grep prune .git, node_modules, and common credential paths. Diagnostic tools are fixed read-only inspections for logs, systemd state, processes, sockets, and filesystem usage. sshro_df defaults to local filesystems only to reduce risk from slow network mounts.\n`;
+		systemPrompt += `\n\nSSH Read-only Mode is active for ${state.target}. Remote working directory: ${state.remoteCwd}. Paths are resolved on the remote host; relative paths resolve from that remote working directory. The sshro_* tools operate on the remote host. Tilde expansion is not supported. The tools apply best-effort credential guardrails: common credential/history/password-manager paths are blocked for direct content access. sshro_ls and sshro_find may show blocked entries with a compact [blocked] marker; sshro_grep prunes blocked paths during recursive content search. Diagnostic tools are fixed read-only inspections for logs, systemd state, processes, sockets, and filesystem usage. sshro_df defaults to local filesystems only to reduce risk from slow network mounts.\n`;
 		return { systemPrompt };
 	});
 }

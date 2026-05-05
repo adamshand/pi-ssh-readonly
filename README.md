@@ -48,7 +48,7 @@ Host *
   ControlPersist 900
 ```
 
-`index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. .env, shell history files, SSH/cloud credential directories). Parent directory listings still show blocked entries, but mark them as blocked so the agent knows they exist and can ask for help if needed. If you have specific requirements edit this.
+`index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. .env, shell history files, SSH/cloud credential directories, password-manager data). Listings and find results still show blocked entries with a compact `[blocked]` marker so the agent knows they exist and can ask for help if needed. If you have specific requirements edit this.
 
 ## Known Issues
 
