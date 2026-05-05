@@ -41,16 +41,32 @@ function validatePathLike(value: string, label: string): void {
 	if (value === "~" || value.startsWith("~/")) throw new Error(`${label}: ~ expansion is not supported in SSH Read-only Mode v1`);
 }
 
+function normalizeRemotePathForPolicy(path: string): string {
+	const absolute = path.startsWith("/");
+	const parts: string[] = [];
+	for (const part of path.replace(/\/+/g, "/").split("/")) {
+		if (!part || part === ".") continue;
+		if (part === "..") {
+			if (parts.length > 0) parts.pop();
+			else if (!absolute) parts.push(part);
+			continue;
+		}
+		parts.push(part);
+	}
+	const normalized = `${absolute ? "/" : ""}${parts.join("/")}`;
+	return normalized || (absolute ? "/" : ".");
+}
+
 function remotePath(input: string | undefined, cwd: string): string {
 	const p = input && input.length > 0 ? input : ".";
 	validatePathLike(p, "path");
-	if (p.startsWith("/")) return p;
-	if (p === ".") return cwd;
-	return `${cwd.replace(/\/+$/, "")}/${p}`;
+	if (p.startsWith("/")) return normalizeRemotePathForPolicy(p);
+	if (p === ".") return normalizeRemotePathForPolicy(cwd);
+	return normalizeRemotePathForPolicy(`${cwd.replace(/\/+$/, "")}/${p}`);
 }
 
 function denyReasonForPath(path: string): string | undefined {
-	const normalized = path.replace(/\/+/g, "/");
+	const normalized = normalizeRemotePathForPolicy(path);
 	const parts = normalized.split("/").filter(Boolean);
 	const base = parts[parts.length - 1] ?? "";
 	const deniedDir = parts.find((part) => DENIED_DIR_NAMES.includes(part));
