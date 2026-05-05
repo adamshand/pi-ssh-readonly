@@ -16,7 +16,7 @@ const DEFAULT_BYTE_LIMIT = 50 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DENIED_DIR_NAMES = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".terraform", ".terraform.d", ".cloudflared", ".cloudflare", ".password-store"];
 const DENIED_PATH_PARTS = ["/.config/gcloud", "/.config/gh", "/.gem/credentials", "/.cargo/credentials"];
-const DENIED_FILE_NAMES = [".env", ".netrc", ".npmrc", ".pypirc", ".gitconfig", ".git-credentials", "terraform.tfstate"];
+const DENIED_FILE_NAMES = [".env", ".netrc", ".npmrc", ".pypirc", ".gitconfig", ".git-credentials", "terraform.tfstate", ".bash_history", ".zsh_history", ".fish_history", ".sh_history", ".ash_history", ".history", ".mysql_history", ".psql_history", ".sqlite_history", ".python_history", ".rediscli_history", ".lesshst", ".wget-hsts"];
 const DENIED_FILE_SUFFIXES = [".pem", ".key", ".p12", ".pfx"];
 const DENIED_FILE_PREFIXES = [".env.", "terraform.tfstate."];
 
@@ -179,6 +179,30 @@ function shellWord(value: string, label: string): string {
 	return shellQuote(value);
 }
 
+function joinRemotePath(parent: string, child: string): string {
+	return normalizeRemotePathForPolicy(`${parent.replace(/\/+$/, "")}/${child}`);
+}
+
+function markBlockedLsEntries(output: string, listedPath: string): string {
+	return output
+		.split("\n")
+		.map((line) => {
+			if (!line || line.startsWith("total ") || line.startsWith("[stderr]")) return line;
+			const match = line.match(/^(\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+)(.+)$/);
+			if (!match) return line;
+			const name = match[2].split(" -> ", 1)[0];
+			if (name === "." || name === "..") return line;
+			const reason = denyReasonForPath(joinRemotePath(listedPath, name));
+			return reason ? `${line} [ssh-ro blocked: ${reason}]` : line;
+		})
+		.join("\n");
+}
+
+function psHasOnlyHeader(output: string): boolean {
+	const lines = output.split(/\r?\n/).filter((line) => line.trim().length > 0);
+	return lines.length === 1 && /^\s*PID\s+PPID\s+USER\s+STAT\s+ELAPSED\s+%CPU\s+%MEM\s+COMMAND/.test(lines[0]);
+}
+
 function requireHealthy(): { target: string; remoteCwd: string } {
 	if (!state.active) throw new Error("SSH Read-only Mode is not active");
 	if (state.fatal) throw new Error(`SSH Read-only Mode startup failed: ${state.reason}`);
@@ -293,7 +317,8 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 500)));
 				const script = `p=${shellQuote(p)}; if [ -d "$p" ]; then LC_ALL=C ls -la "$p"; else LC_ALL=C ls -ld "$p"; fi`;
 				const r = await sshExec(target, script, signal);
-				const combined = `${r.stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}`;
+				const stdout = r.code === 0 ? markBlockedLsEntries(r.stdout, p) : r.stdout;
+				const combined = `${stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}`;
 				return textResult(truncateText(combined, limit), r.code !== 0);
 			} catch (err) {
 				return textResult(err instanceof Error ? err.message : String(err), true);
@@ -461,7 +486,9 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				script += ` | sed -n '1,${limit}p'`;
 				const r = await sshExec(target, script, signal, 20_000);
 				const output = r.stdout + r.stderr;
-				return textResult(output.trim().length ? truncateText(output, limit) : "No matching processes", r.code !== 0 && output.trim().length === 0);
+				const noMatches = output.trim().length === 0 || psHasOnlyHeader(output);
+				const filters = [user ? `user=${user}` : undefined, pattern ? `pattern=${pattern}` : undefined].filter(Boolean).join(" ");
+				return textResult(noMatches ? `No matching processes${filters ? ` for ${filters}` : ""}` : truncateText(output, limit), r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
 				return textResult(err instanceof Error ? err.message : String(err), true);
 			}
@@ -488,7 +515,10 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 500)));
 				const script = `command -v ss >/dev/null 2>&1 || { echo 'ss not found on remote host' >&2; exit 127; }; ss ${flags} 2>&1 | sed -n '1,${limit}p'`;
 				const r = await sshExec(target, script, signal, 20_000);
-				const output = r.stdout + r.stderr;
+				let output = r.stdout + r.stderr;
+				if (params.processInfo && output.trim().length > 0 && !output.includes("users:(")) {
+					output += "\n[ssh-ro note] processInfo=true was requested, but no process ownership details were visible. This usually means the SSH user lacks permission to inspect socket owners.\n";
+				}
 				return textResult(output.trim().length ? truncateText(output, limit) : "No socket output", r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
 				return textResult(err instanceof Error ? err.message : String(err), true);
