@@ -23,7 +23,7 @@ pi --sshro adam@server
 
 **Requires passwordless SSH. It will not prompt for a password.**
 
-You can run a command and feed it back to the agent by using the `!` command, eg.
+You can run a shell command and automatically feed it back to the agent by using the `!` command, eg.
 
 ```bash
 ! echo 'the agent can see this'
