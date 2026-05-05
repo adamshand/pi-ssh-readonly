@@ -15,8 +15,8 @@ const DEFAULT_LINE_LIMIT = 2000;
 const DEFAULT_BYTE_LIMIT = 50 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DENIED_DIR_NAMES = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".terraform", ".terraform.d", ".cloudflared", ".cloudflare", ".password-store"];
-const DENIED_PATH_PARTS = ["/.config/gcloud", "/.config/gh", "/.config/Bitwarden CLI", "/.config/Bitwarden", "/.config/bitwarden", "/.config/1Password", "/.config/op", "/.config/keepassxc", "/.config/KeePass", "/.config/keepass", "/.config/gopass", "/.local/share/fish", "/.local/share/nano", "/.local/share/keepassxc", "/.local/share/gopass", "/.gem/credentials", "/.cargo/credentials"];
-const DENIED_FILE_NAMES = [".env", ".netrc", ".npmrc", ".pypirc", ".gitconfig", ".git-credentials", "terraform.tfstate", ".bash_history", ".zsh_history", ".zhistory", ".fish_history", "fish_history", ".sh_history", ".ash_history", ".history", "search_history", ".mysql_history", ".psql_history", ".sqlite_history", ".python_history", ".node_repl_history", ".rediscli_history", ".lesshst", ".wget-hsts"];
+const DENIED_PATH_PARTS = ["/.config/gcloud", "/.config/gh", "/.config/Bitwarden CLI", "/.config/Bitwarden", "/.config/bitwarden", "/.config/1Password", "/.config/op", "/.config/keepassxc", "/.config/KeePass", "/.config/keepass", "/.config/gopass", "/.config/chezmoi", "/.local/share/fish", "/.local/share/nano", "/.local/share/keepassxc", "/.local/share/gopass", "/.local/share/chezmoi", "/.gem/credentials", "/.cargo/credentials"];
+const DENIED_FILE_NAMES = [".env", ".netrc", ".npmrc", ".pypirc", ".gitconfig", ".git-credentials", "terraform.tfstate", ".chezmoi.toml", ".chezmoi.yaml", ".chezmoi.json", ".chezmoiignore", ".bash_history", ".zsh_history", ".zhistory", ".fish_history", "fish_history", ".sh_history", ".ash_history", ".history", "search_history", ".mysql_history", ".psql_history", ".sqlite_history", ".python_history", ".node_repl_history", ".rediscli_history", ".lesshst", ".wget-hsts"];
 const DENIED_FILE_SUFFIXES = [".pem", ".key", ".p12", ".pfx", "_history"];
 const DENIED_FILE_PREFIXES = [".env.", "terraform.tfstate."];
 
@@ -223,6 +223,10 @@ function markBlockedFindEntries(output: string): string {
 function psHasOnlyHeader(output: string): boolean {
 	const lines = output.split(/\r?\n/).filter((line) => line.trim().length > 0);
 	return lines.length === 1 && /^\s*PID\s+PPID\s+USER\s+STAT\s+ELAPSED\s+%CPU\s+%MEM\s+COMMAND/.test(lines[0]);
+}
+
+function sshRoModeNote(target: string, remoteCwd: string): string {
+	return `SSH Read-only Mode active: ${target}\nRemote cwd: ${remoteCwd}\n\nAvailable tools:\n${TOOL_NAMES.join(", ")}\n\nPath notes:\n- Paths are remote paths; relative paths resolve from the remote cwd.\n- ~ is not expanded; use absolute paths like /home/name/... or relative paths from the remote cwd.\n- [blocked] means credential/history/password-manager content is blocked; ask the user to inspect manually if needed.\n- sshro_find shows matching blocked entries but does not descend into blocked directories, so parent searches may not enumerate blocked children.\n- sshro_df defaults to local filesystems only to reduce risk from slow network mounts.`;
 }
 
 function requireHealthy(): { target: string; remoteCwd: string } {
@@ -612,6 +616,12 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 			pi.setActiveTools([...TOOL_NAMES]);
 			ctx.ui.setStatus("ssh-ro", ctx.ui.theme.fg("accent", `SSH RO ${target}:${remoteCwd}`));
 			ctx.ui.notify(`SSH Read-only Mode: ${target}:${remoteCwd}`, "info");
+			pi.sendMessage({
+				customType: "ssh-ro-info",
+				content: sshRoModeNote(target, remoteCwd),
+				display: true,
+				details: { target, remoteCwd, tools: TOOL_NAMES },
+			});
 		} catch (err) {
 			const target = typeof raw === "string" ? raw.trim() : "<unknown>";
 			failClosed(pi, ctx, target, err instanceof Error ? err.message : String(err));
@@ -631,7 +641,7 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 		const localCwd = process.cwd();
 		const remoteLine = `Current working directory: ${state.remoteCwd} (SSH Read-only Mode target: ${state.target})`;
 		let systemPrompt = event.systemPrompt.replace(`Current working directory: ${localCwd}`, remoteLine);
-		systemPrompt += `\n\nSSH Read-only Mode is active for ${state.target}. Remote working directory: ${state.remoteCwd}. Paths are resolved on the remote host; relative paths resolve from that remote working directory. The sshro_* tools operate on the remote host. Tilde expansion is not supported. The tools apply best-effort credential guardrails: common credential/history/password-manager paths are blocked for direct content access. sshro_ls and sshro_find may show blocked entries with a compact [blocked] marker; sshro_grep prunes blocked paths during recursive content search. Diagnostic tools are fixed read-only inspections for logs, systemd state, processes, sockets, and filesystem usage. sshro_df defaults to local filesystems only to reduce risk from slow network mounts.\n`;
+		systemPrompt += `\n\n${sshRoModeNote(state.target, state.remoteCwd)}\n`;
 		return { systemPrompt };
 	});
 }
