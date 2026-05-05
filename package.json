@@ -8,6 +8,9 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "dependencies": {
+    "typebox": "^1.1.31"
+  },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"

@@ -53,7 +53,7 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - **SSH Read-only Mode** is provided by a **Global Auto-loaded Extension** in v1 at `~/.pi/agent/extensions/ssh-readonly/index.ts`.
 - A **Remote Working Directory** is not a confinement boundary; absolute remote paths remain accessible in v1.
 - `--ssh-ro` accepts only an SSH target in v1; the **Remote Working Directory** is resolved once at startup as the SSH user's login directory and remains fixed for the session.
-- **SSH Read-only Mode** exposes `sshro_read`, `sshro_ls`, `sshro_find`, and `sshro_grep` as **SSH Read-only Tools**.
+- **SSH Read-only Mode** exposes `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, and `sshro_df` as **SSH Read-only Tools**.
 - The `sshro_read`, `sshro_ls`, `sshro_find`, and `sshro_grep` tools mirror the practical built-in read-only tool schemas where possible.
 - The `sshro_read` tool keeps the familiar `path`, `offset`, and `limit` interface but performs line-range extraction on the remote server rather than downloading whole files for local slicing.
 - When no `offset` or `limit` is provided, `sshro_read` returns the beginning of the file up to pi-like truncation limits and can be adjusted later if logfile investigation proves this insufficient.
@@ -69,7 +69,7 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - If **SSH Read-only Mode** is requested but startup checks fail, v1 fails closed by clearing active tools, blocking all tool calls, and showing a fatal status/error instead of continuing in normal local mode.
 - On every session start or reload, v1 initializes **SSH Read-only Mode** from the `--ssh-ro` CLI flag; the CLI flag is the source of truth, not persisted session state.
 - When `--ssh-ro` is absent, the global extension is effectively invisible: it registers only the `--ssh-ro` flag and does not register SSH read-only tools, alter active tools, change prompts, or show UI.
-- When `--ssh-ro` is active, the extension registers `sshro_read`, `sshro_ls`, `sshro_find`, and `sshro_grep`, sets the active tool list to exactly those tools, and blocks all other agent tool calls defensively; local built-in tools are not active.
+- When `--ssh-ro` is active, the extension registers `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, and `sshro_df`, sets the active tool list to exactly those tools, and blocks all other agent tool calls defensively; local built-in tools are not active.
 - v1 uses the **System SSH Client** rather than an SSH library; IPv6 target parsing is out of scope.
 - v1 allows any SSH target accepted by the **System SSH Client**, including root login targets such as `root@server`.
 - v1 does not support sudo escalation; use an SSH target with the desired read visibility.
@@ -78,11 +78,16 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - v1 applies best-effort credential guardrails: direct reads/lists/search roots are blocked for common credential directories/files, and recursive `sshro_find`/`sshro_grep` prune common credential directories and file patterns by default. This is not a chroot or adversarial DLP boundary.
 - v1 does not expand `~` in tool paths; use absolute home paths such as `/home/name` or paths relative to the **Remote Working Directory**.
 - v1 rejects tool paths and patterns containing newlines or control characters while allowing ordinary spaces and punctuation through shell quoting.
-- v1 uses tool-specific SSH command timeouts, with shorter bounds for startup/read/list operations and longer bounds for recursive `grep`/`find`.
+- v1 uses tool-specific SSH command timeouts, with shorter bounds for startup/read/list/diagnostic operations and longer bounds for recursive `grep`/`find` and journal inspection.
 - v1 uses pi-like output limits by default: roughly 50KB or 2000 lines for reads, 1000 entries/results/matches for listing and search, and bounded visible error output.
 - `sshro_ls` returns investigation-oriented metadata such as type, permissions, owner, size, modification time, symlink targets, and name, and includes hidden files by default.
 - `sshro_find` uses remote POSIX `find`; patterns without `/` are filename globs via `-name`, while patterns containing `/` are path globs via `-path`.
 - `sshro_find` includes hidden files by default but prunes `.git`, `node_modules`, and common credential paths from traversal.
+- `sshro_journalctl` reads recent systemd journal output with optional unit, time range, priority, grep, and line-limit filters; it does not make `journalctl` a startup requirement because not every target is systemd-based.
+- `sshro_systemctl` exposes only fixed read-only systemd inspections: failed units, service lists, status, and selected `systemctl show` properties.
+- `sshro_ps` reads the process table with optional user/pattern filtering and cpu/memory/pid sorting; process command lines can reveal sensitive arguments, so this is read-only but not secret-redacting.
+- `sshro_ss` reads TCP/UDP socket state with `ss`, defaulting to listening sockets without process ownership; process info is optional and may require privileges.
+- `sshro_df` reads filesystem usage with `df`, defaulting to `df -l` local filesystems only to reduce risk from slow or hanging network mounts; callers can opt into non-local filesystems explicitly.
 
 ## Example dialogue
 

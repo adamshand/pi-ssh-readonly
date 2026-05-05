@@ -10,6 +10,11 @@ This extension disables all built in tools and adds a new set of read only tools
 - sshro_ls
 - sshro_find
 - sshro_grep
+- sshro_journalctl
+- sshro_systemctl
+- sshro_ps
+- sshro_ss
+- sshro_df
 
 ⚠️ ⚠️ ⚠️  This is extension is vibe coded.  **Use at your own risk.**  It's working well for me, and hasn't eaten anyones homework yet. 🤞 🤞
 
@@ -50,7 +55,6 @@ Host *
 
 ## Future
 
-- Add a richer set of tools to help the agent diagnose problems: `ps`, `netstat`, `ifconfig`, `journalctl`, `systemd` etc
 - Investigate sandboxing all tools inside `systemd-run` to provide a layer of protection in case of bugs in the tools.
 - Give the agent a way to perform web searches.
 - Give the agent the ability to read files it doesn't have permissions for.

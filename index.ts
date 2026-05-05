@@ -2,13 +2,14 @@ import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { createFindTool, createGrepTool, createLsTool, createReadTool } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
+import Type from "typebox";
 
 type SshRoState =
 	| { active: false; fatal?: undefined }
 	| { active: true; target: string; remoteCwd: string; fatal: false }
 	| { active: true; target: string; remoteCwd?: string; fatal: true; reason: string };
 
-const TOOL_NAMES = ["sshro_read", "sshro_ls", "sshro_find", "sshro_grep"] as const;
+const TOOL_NAMES = ["sshro_read", "sshro_ls", "sshro_find", "sshro_grep", "sshro_journalctl", "sshro_systemctl", "sshro_ps", "sshro_ss", "sshro_df"] as const;
 const REQUIRED_REMOTE_COMMANDS = ["file", "find", "grep", "sed", "stat", "ls"];
 const DEFAULT_LINE_LIMIT = 2000;
 const DEFAULT_BYTE_LIMIT = 50 * 1024;
@@ -169,6 +170,15 @@ function textResult(text: string, isError = false) {
 	return { content: [{ type: "text" as const, text }], isError };
 }
 
+function optionalString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function shellWord(value: string, label: string): string {
+	validatePathLike(value, label);
+	return shellQuote(value);
+}
+
 function requireHealthy(): { target: string; remoteCwd: string } {
 	if (!state.active) throw new Error("SSH Read-only Mode is not active");
 	if (state.fatal) throw new Error(`SSH Read-only Mode startup failed: ${state.reason}`);
@@ -209,6 +219,36 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	const lsParams = createLsTool(cwd).parameters;
 	const findParams = createFindTool(cwd).parameters;
 	const grepParams = createGrepTool(cwd).parameters;
+	const journalctlParams = Type.Object({
+		unit: Type.Optional(Type.String({ description: "systemd unit to filter, e.g. nginx.service" })),
+		since: Type.Optional(Type.String({ description: "journalctl --since value, e.g. '1 hour ago'" })),
+		until: Type.Optional(Type.String({ description: "journalctl --until value" })),
+		priority: Type.Optional(Type.Union([Type.Literal("emerg"), Type.Literal("alert"), Type.Literal("crit"), Type.Literal("err"), Type.Literal("warning"), Type.Literal("notice"), Type.Literal("info"), Type.Literal("debug")])),
+		grep: Type.Optional(Type.String({ description: "Filter output with remote grep -i" })),
+		lines: Type.Optional(Type.Number({ description: "Maximum recent journal lines, default 200, max 2000" })),
+	});
+	const systemctlParams = Type.Object({
+		action: Type.Union([Type.Literal("failed"), Type.Literal("status"), Type.Literal("show"), Type.Literal("list")]),
+		unit: Type.Optional(Type.String({ description: "Unit name for status/show, e.g. nginx.service" })),
+	});
+	const psParams = Type.Object({
+		user: Type.Optional(Type.String({ description: "Filter to this process owner" })),
+		pattern: Type.Optional(Type.String({ description: "Filter command lines with grep -i" })),
+		sort: Type.Optional(Type.Union([Type.Literal("cpu"), Type.Literal("mem"), Type.Literal("pid")])),
+		limit: Type.Optional(Type.Number({ description: "Maximum output lines, default 80, max 2000" })),
+	});
+	const ssParams = Type.Object({
+		listeningOnly: Type.Optional(Type.Boolean({ description: "Show only listening sockets, default true" })),
+		tcp: Type.Optional(Type.Boolean({ description: "Include TCP sockets, default true" })),
+		udp: Type.Optional(Type.Boolean({ description: "Include UDP sockets, default true" })),
+		processInfo: Type.Optional(Type.Boolean({ description: "Include process info with ss -p; may require privileges" })),
+		limit: Type.Optional(Type.Number({ description: "Maximum output lines, default 500, max 2000" })),
+	});
+	const dfParams = Type.Object({
+		path: Type.Optional(Type.String({ description: "Optional path/filesystem to inspect" })),
+		localOnly: Type.Optional(Type.Boolean({ description: "Use df -l to avoid remote/network filesystems, default true" })),
+		human: Type.Optional(Type.Boolean({ description: "Human-readable sizes, default true" })),
+	});
 
 	pi.registerTool({
 		name: "sshro_read",
@@ -330,6 +370,163 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_grep"))} ${theme.fg("accent", args.pattern ?? "...")} ${theme.fg("muted", args.path ?? ".")}`, 0, 0);
 		},
 	});
+
+	pi.registerTool({
+		name: "sshro_journalctl",
+		label: "sshro_journalctl",
+		description: "Read recent systemd journal logs from the SSH Read-only Mode target with optional unit/time/priority filters.",
+		promptSnippet: "sshro_journalctl: Inspect recent systemd journal logs by unit, time range, priority, and grep filter.",
+		parameters: journalctlParams,
+		executionMode: "parallel",
+		async execute(_id, params, signal) {
+			try {
+				const { target } = requireHealthy();
+				const lines = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.lines ?? 200)));
+				const args = ["--no-pager", "--output=short-iso", "-n", String(lines)];
+				const unit = optionalString(params.unit);
+				const since = optionalString(params.since);
+				const until = optionalString(params.until);
+				const priority = optionalString(params.priority);
+				const grep = optionalString(params.grep);
+				if (unit) args.push("-u", shellWord(unit, "unit"));
+				if (since) args.push("--since", shellWord(since, "since"));
+				if (until) args.push("--until", shellWord(until, "until"));
+				if (priority) args.push("-p", shellWord(priority, "priority"));
+				if (grep) validatePathLike(grep, "grep");
+				const base = `command -v journalctl >/dev/null 2>&1 || { echo 'journalctl not found on remote host' >&2; exit 127; }; journalctl ${args.join(" ")} 2>&1`;
+				const script = grep ? `${base} | grep -i -- ${shellQuote(grep)} | sed -n '1,${lines}p'` : `${base} | sed -n '1,${lines}p'`;
+				const r = await sshExec(target, script, signal, 45_000);
+				const output = r.stdout + r.stderr;
+				return textResult(output.trim().length ? truncateText(output, lines) : "No journal output", r.code !== 0 && output.trim().length === 0);
+			} catch (err) {
+				return textResult(err instanceof Error ? err.message : String(err), true);
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_journalctl"))} ${theme.fg("accent", args.unit ?? args.priority ?? "recent")}`, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "sshro_systemctl",
+		label: "sshro_systemctl",
+		description: "Inspect systemd unit state on the SSH Read-only Mode target. Supports failed, list, status, and show actions only.",
+		promptSnippet: "sshro_systemctl: Inspect systemd failed units, service lists, unit status, and selected unit properties.",
+		parameters: systemctlParams,
+		executionMode: "parallel",
+		async execute(_id, params, signal) {
+			try {
+				const { target } = requireHealthy();
+				const action = params.action;
+				const unit = optionalString(params.unit);
+				if ((action === "status" || action === "show") && !unit) throw new Error(`sshro_systemctl action '${action}' requires unit`);
+				if (unit) validatePathLike(unit, "unit");
+				let cmd: string;
+				if (action === "failed") cmd = "systemctl --no-pager --plain --failed";
+				else if (action === "list") cmd = "systemctl --no-pager --plain list-units --type=service --all";
+				else if (action === "status") cmd = `systemctl --no-pager --plain status ${shellQuote(unit!)}`;
+				else cmd = `systemctl show ${shellQuote(unit!)} --property=Id,Names,Description,LoadState,ActiveState,SubState,UnitFileState,Result,ExecMainCode,ExecMainStatus,MainPID,FragmentPath,DropInPaths,Requires,Wants,After,Before,Restart,RestartUSec,StartLimitBurst,StartLimitIntervalUSec`;
+				const script = `command -v systemctl >/dev/null 2>&1 || { echo 'systemctl not found on remote host' >&2; exit 127; }; ${cmd} 2>&1 | sed -n '1,${DEFAULT_LINE_LIMIT}p'`;
+				const r = await sshExec(target, script, signal, 30_000);
+				const output = r.stdout + r.stderr;
+				return textResult(truncateText(output || "No systemctl output"), r.code !== 0 && output.trim().length === 0);
+			} catch (err) {
+				return textResult(err instanceof Error ? err.message : String(err), true);
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_systemctl"))} ${theme.fg("accent", args.action ?? "...")} ${theme.fg("muted", args.unit ?? "")}`, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "sshro_ps",
+		label: "sshro_ps",
+		description: "Inspect the remote process table with optional user/pattern filtering and cpu/memory sorting.",
+		promptSnippet: "sshro_ps: Inspect remote processes, optionally filtered by owner or command-line pattern.",
+		parameters: psParams,
+		executionMode: "parallel",
+		async execute(_id, params, signal) {
+			try {
+				const { target } = requireHealthy();
+				const user = optionalString(params.user);
+				const pattern = optionalString(params.pattern);
+				if (user) validatePathLike(user, "user");
+				if (pattern) validatePathLike(pattern, "pattern");
+				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 80)));
+				const sort = params.sort === "mem" ? "--sort=-%mem" : params.sort === "pid" ? "--sort=pid" : "--sort=-%cpu";
+				let script = `ps -eo pid,ppid,user,stat,etime,%cpu,%mem,args ${sort} 2>&1`;
+				if (user) script += ` | awk -v u=${shellQuote(user)} 'NR==1 || $3 == u'`;
+				if (pattern) script += ` | grep -i -- ${shellQuote(pattern)}`;
+				script += ` | sed -n '1,${limit}p'`;
+				const r = await sshExec(target, script, signal, 20_000);
+				const output = r.stdout + r.stderr;
+				return textResult(output.trim().length ? truncateText(output, limit) : "No matching processes", r.code !== 0 && output.trim().length === 0);
+			} catch (err) {
+				return textResult(err instanceof Error ? err.message : String(err), true);
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_ps"))} ${theme.fg("accent", args.pattern ?? args.user ?? "processes")}`, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "sshro_ss",
+		label: "sshro_ss",
+		description: "Inspect remote TCP/UDP sockets using ss. Defaults to listening TCP/UDP sockets without process info.",
+		promptSnippet: "sshro_ss: Inspect remote TCP/UDP socket state, especially listening ports.",
+		parameters: ssParams,
+		executionMode: "parallel",
+		async execute(_id, params, signal) {
+			try {
+				const { target } = requireHealthy();
+				const includeTcp = params.tcp !== false;
+				const includeUdp = params.udp !== false;
+				const proto = includeTcp || includeUdp ? `${includeTcp ? "t" : ""}${includeUdp ? "u" : ""}` : "tu";
+				const flags = `-${proto}${params.listeningOnly === false ? "a" : "l"}n${params.processInfo ? "p" : ""}`;
+				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 500)));
+				const script = `command -v ss >/dev/null 2>&1 || { echo 'ss not found on remote host' >&2; exit 127; }; ss ${flags} 2>&1 | sed -n '1,${limit}p'`;
+				const r = await sshExec(target, script, signal, 20_000);
+				const output = r.stdout + r.stderr;
+				return textResult(output.trim().length ? truncateText(output, limit) : "No socket output", r.code !== 0 && output.trim().length === 0);
+			} catch (err) {
+				return textResult(err instanceof Error ? err.message : String(err), true);
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_ss"))} ${theme.fg("accent", args.listeningOnly === false ? "all sockets" : "listening sockets")}`, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "sshro_df",
+		label: "sshro_df",
+		description: "Inspect remote filesystem free space using df. Defaults to local filesystems only to reduce risk from hanging network mounts.",
+		promptSnippet: "sshro_df: Inspect remote filesystem free space; defaults to df -l for local filesystems only.",
+		parameters: dfParams,
+		executionMode: "parallel",
+		async execute(_id, params, signal) {
+			try {
+				const { target, remoteCwd } = requireHealthy();
+				const path = optionalString(params.path);
+				const resolvedPath = path ? remotePath(path, remoteCwd) : undefined;
+				if (resolvedPath) assertPathAllowed(resolvedPath);
+				const flags = ["-P"];
+				if (params.human !== false) flags.push("-h");
+				if (params.localOnly !== false) flags.push("-l");
+				const script = `df ${flags.join(" ")}${resolvedPath ? ` ${shellQuote(resolvedPath)}` : ""} 2>&1 | sed -n '1,${DEFAULT_LINE_LIMIT}p'`;
+				const r = await sshExec(target, script, signal, 15_000);
+				const output = r.stdout + r.stderr;
+				return textResult(output.trim().length ? truncateText(output) : "No df output", r.code !== 0 && output.trim().length === 0);
+			} catch (err) {
+				return textResult(err instanceof Error ? err.message : String(err), true);
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_df"))} ${theme.fg("accent", args.path ?? "filesystems")}`, 0, 0);
+		},
+	});
 }
 
 function failClosed(pi: ExtensionAPI, ctx: ExtensionContext, target: string, reason: string): void {
@@ -380,7 +577,7 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 		const localCwd = process.cwd();
 		const remoteLine = `Current working directory: ${state.remoteCwd} (SSH Read-only Mode target: ${state.target})`;
 		let systemPrompt = event.systemPrompt.replace(`Current working directory: ${localCwd}`, remoteLine);
-		systemPrompt += `\n\nSSH Read-only Mode is active for ${state.target}. Remote working directory: ${state.remoteCwd}. Paths are resolved on the remote host; relative paths resolve from that remote working directory. The sshro_read, sshro_ls, sshro_find, and sshro_grep tools operate on the remote host. Tilde expansion is not supported. The tools apply best-effort credential guardrails: common credential directories/files are blocked for direct access, and recursive sshro_find and sshro_grep prune .git, node_modules, and common credential paths.\n`;
+		systemPrompt += `\n\nSSH Read-only Mode is active for ${state.target}. Remote working directory: ${state.remoteCwd}. Paths are resolved on the remote host; relative paths resolve from that remote working directory. The sshro_* tools operate on the remote host. Tilde expansion is not supported. The tools apply best-effort credential guardrails: common credential directories/files are blocked for direct access, and recursive sshro_find and sshro_grep prune .git, node_modules, and common credential paths. Diagnostic tools are fixed read-only inspections for logs, systemd state, processes, sockets, and filesystem usage. sshro_df defaults to local filesystems only to reduce risk from slow network mounts.\n`;
 		return { systemPrompt };
 	});
 }
