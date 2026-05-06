@@ -15,6 +15,9 @@ This extension disables all built in tools and adds a new set of read only tools
 - sshro_ps
 - sshro_ss
 - sshro_df
+- sshro_docker_ps
+- sshro_docker_inspect
+- sshro_docker_stats
 
 ⚠️ ⚠️ ⚠️  This is extension is vibe coded.  **Use at your own risk.**  It's working well for me, and hasn't eaten anyones homework yet. 🤞 🤞
 
@@ -49,6 +52,8 @@ Host *
 ```
 
 `index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. .env, shell history files, SSH/cloud credential directories, password-manager data, chezmoi data). Listings and find results still show blocked entries with a compact `[blocked]` marker so the agent knows they exist and can ask for help if needed. `sshro_find` does not descend into blocked directories, so parent searches may not enumerate blocked children. If you have specific requirements edit this.
+
+Docker tools are optional and checked when the tool runs, not at startup. `sshro_docker_ps` and `sshro_docker_stats` return parsed JSON. `sshro_docker_inspect` returns curated JSON by default and visibly redacts container environment variables because Docker metadata can contain secrets. `sshro_docker_stats` always uses one-shot `--no-stream` mode.
 
 ## Known Issues
 

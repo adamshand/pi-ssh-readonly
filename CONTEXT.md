@@ -53,14 +53,14 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - **SSH Read-only Mode** is provided by a **Global Auto-loaded Extension** in v1 at `~/.pi/agent/extensions/ssh-readonly/index.ts`.
 - A **Remote Working Directory** is not a confinement boundary; absolute remote paths remain accessible in v1.
 - `--ssh-ro` accepts only an SSH target in v1; the **Remote Working Directory** is resolved once at startup as the SSH user's login directory and remains fixed for the session.
-- **SSH Read-only Mode** exposes `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, and `sshro_df` as **SSH Read-only Tools**.
+- **SSH Read-only Mode** exposes `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, `sshro_df`, `sshro_docker_ps`, `sshro_docker_inspect`, and `sshro_docker_stats` as **SSH Read-only Tools**.
 - The `sshro_read`, `sshro_ls`, `sshro_find`, and `sshro_grep` tools mirror the practical built-in read-only tool schemas where possible.
 - The `sshro_read` tool keeps the familiar `path`, `offset`, and `limit` interface but performs line-range extraction on the remote server rather than downloading whole files for local slicing.
 - When no `offset` or `limit` is provided, `sshro_read` returns the beginning of the file up to pi-like truncation limits and can be adjusted later if logfile investigation proves this insufficient.
 - `sshro_read` is text-only in v1, uses remote `file` output to classify non-text files, shows that classification in the tool result, and refuses binary content rather than preserving built-in image support.
 - `sshro_grep` uses remote grep semantics in v1, searches directories recursively, prunes `.git`, `node_modules`, and common credential paths, skips binary files by default, supports simple file-selection globs such as `*.conf` or `*.log` to reduce tool calls, treats `pattern` as regex by default, and uses fixed-string matching when `literal: true`.
 - Remote `grep` and `find` return **Visible Search Errors** alongside any successful results, truncating only when error volume is excessive.
-- The **SSH Read-only Tool Gate** requires active tools to be exactly `sshro_read`, `sshro_ls`, `sshro_find`, and `sshro_grep`, warns about unrelated inactive tools, and blocks all other tool calls.
+- The **SSH Read-only Tool Gate** requires active tools to be exactly the registered `sshro_*` tools, warns about unrelated inactive tools, and blocks all other tool calls.
 - v1 does not keep non-file helper tools such as questionnaire active during **SSH Read-only Mode**.
 - The **User Bash Escape Hatch** remains available without extra warnings; **SSH Read-only Mode** restricts agent tools, not experienced sysadmin actions.
 - The agent may suggest human-run commands without special read-only prompting; the sysadmin remains responsible for deciding whether to run them.
@@ -69,12 +69,12 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - If **SSH Read-only Mode** is requested but startup checks fail, v1 fails closed by clearing active tools, blocking all tool calls, and showing a fatal status/error instead of continuing in normal local mode.
 - On every session start or reload, v1 initializes **SSH Read-only Mode** from the `--ssh-ro` CLI flag; the CLI flag is the source of truth, not persisted session state.
 - When `--ssh-ro` is absent, the global extension is effectively invisible: it registers only the `--ssh-ro` flag and does not register SSH read-only tools, alter active tools, change prompts, or show UI.
-- When `--ssh-ro` is active, the extension registers `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, and `sshro_df`, sets the active tool list to exactly those tools, and blocks all other agent tool calls defensively; local built-in tools are not active.
+- When `--ssh-ro` is active, the extension registers `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, `sshro_df`, `sshro_docker_ps`, `sshro_docker_inspect`, and `sshro_docker_stats`, sets the active tool list to exactly those tools, and blocks all other agent tool calls defensively; local built-in tools are not active.
 - v1 uses the **System SSH Client** rather than an SSH library; IPv6 target parsing is out of scope.
 - v1 allows any SSH target accepted by the **System SSH Client**, including root login targets such as `root@server`.
 - v1 does not support sudo escalation; use an SSH target with the desired read visibility.
 - v1 uses **Fixed Remote Command Templates** for SSH execution rather than installing helpers or sending scripts over stdin; templates are executed through remote `sh -c` so non-POSIX login shells such as fish do not parse the templates.
-- **Remote Prompt Context** replaces the normal local current-working-directory line with the fixed **Remote Working Directory** and states that `sshro_read`, `sshro_ls`, `sshro_find`, and `sshro_grep` operate on the SSH target.
+- **Remote Prompt Context** replaces the normal local current-working-directory line with the fixed **Remote Working Directory** and states that `sshro_*` tools operate on the SSH target.
 - v1 applies best-effort credential guardrails: direct content reads/searches are blocked for common credential directories/files, shell history files, password-manager paths, and chezmoi paths. Recursive `sshro_grep` prunes common credential/history/password-manager/dotfile-manager paths by default. This is not a chroot or adversarial DLP boundary.
 - v1 does not expand `~` in tool paths; use absolute home paths such as `/home/name` or paths relative to the **Remote Working Directory**.
 - v1 rejects tool paths and patterns containing newlines or control characters while allowing ordinary spaces and punctuation through shell quoting.
@@ -88,6 +88,10 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - `sshro_ps` reads the process table with optional user/pattern filtering and cpu/memory/pid sorting; process command lines can reveal sensitive arguments, so this is read-only but not secret-redacting. Header-only filtered results are reported as `No matching processes`.
 - `sshro_ss` reads TCP/UDP socket state with `ss`, defaulting to listening sockets without process ownership; process info is optional and may require privileges. If process info is requested but not visible, the tool appends a note explaining the likely permission limitation.
 - `sshro_df` reads filesystem usage with `df`, defaulting to `df -l` local filesystems only to reduce risk from slow or hanging network mounts; callers can opt into non-local filesystems explicitly.
+- Docker tools are optional runtime diagnostics and are not part of startup health checks; each Docker tool returns a clear tool error if Docker is missing or inaccessible to the SSH user.
+- `sshro_docker_ps` reads `docker ps --format json`, parses Docker's line-delimited JSON locally, and returns a pretty JSON array; if JSON output is unavailable or unparseable, it returns a clear error rather than falling back to table output.
+- `sshro_docker_inspect` reads Docker inspect JSON and returns curated pretty JSON. Container environment variable values are never shown; if present, they are visibly marked as `[redacted]` so the agent can ask the human operator for help if needed.
+- `sshro_docker_stats` reads one-shot `docker stats --no-stream` output, parses Docker JSON rows locally, and never starts Docker's streaming stats mode.
 - On successful SSH Read-only Mode startup, the extension emits one visible `ssh-ro-info` message containing the same concise mode note that is appended to the agent system prompt, reducing drift between human-visible and agent-visible guidance.
 
 ## Example dialogue
