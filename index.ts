@@ -9,7 +9,7 @@ type SshRoState =
 	| { active: true; target: string; remoteCwd: string; fatal: false }
 	| { active: true; target: string; remoteCwd?: string; fatal: true; reason: string };
 
-const TOOL_NAMES = ["sshro_read", "sshro_ls", "sshro_find", "sshro_grep", "sshro_journalctl", "sshro_systemctl", "sshro_ps", "sshro_ss", "sshro_df"] as const;
+const TOOL_NAMES = ["sshro_read", "sshro_ls", "sshro_find", "sshro_grep", "sshro_journalctl", "sshro_systemctl", "sshro_ps", "sshro_ss", "sshro_df", "sshro_docker_ps", "sshro_docker_inspect", "sshro_docker_stats"] as const;
 const REQUIRED_REMOTE_COMMANDS = ["file", "find", "grep", "sed", "stat", "ls"];
 const DEFAULT_LINE_LIMIT = 2000;
 const DEFAULT_BYTE_LIMIT = 50 * 1024;
@@ -225,8 +225,98 @@ function psHasOnlyHeader(output: string): boolean {
 	return lines.length === 1 && /^\s*PID\s+PPID\s+USER\s+STAT\s+ELAPSED\s+%CPU\s+%MEM\s+COMMAND/.test(lines[0]);
 }
 
+function validateDockerRef(value: string, label: string): void {
+	validatePathLike(value, label);
+}
+
+function parseNdjson(output: string): unknown[] {
+	return output
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
+}
+
+function prettyJson(value: unknown, maxLines = DEFAULT_LINE_LIMIT): string {
+	return truncateText(JSON.stringify(value, null, 2), maxLines);
+}
+
+function dockerUnavailableMessage(stderr: string, stdout: string): string {
+	const message = `${stderr}${stdout}`.trim();
+	return message.length ? message : "Docker command failed without output";
+}
+
+function redactDockerEnvs(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(redactDockerEnvs);
+	if (!value || typeof value !== "object") return value;
+	const out: Record<string, unknown> = {};
+	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+		out[key] = key === "Env" ? (Array.isArray(child) && child.length > 0 ? "[redacted]" : child ?? null) : redactDockerEnvs(child);
+	}
+	return out;
+}
+
+function redactContainerInspect(item: any): unknown {
+	const env = Array.isArray(item?.Config?.Env) ? (item.Config.Env.length > 0 ? "[redacted]" : []) : item?.Config?.Env == null ? null : "[redacted]";
+	return {
+		id: item?.Id,
+		name: item?.Name,
+		image: item?.Image,
+		created: item?.Created,
+		state: item?.State
+			? {
+				status: item.State.Status,
+				running: item.State.Running,
+				paused: item.State.Paused,
+				restarting: item.State.Restarting,
+				oomKilled: item.State.OOMKilled,
+				dead: item.State.Dead,
+				pid: item.State.Pid,
+				exitCode: item.State.ExitCode,
+				error: item.State.Error,
+				startedAt: item.State.StartedAt,
+				finishedAt: item.State.FinishedAt,
+			}
+			: undefined,
+		restartCount: item?.RestartCount,
+		restartPolicy: item?.HostConfig?.RestartPolicy,
+		config: item?.Config
+			? {
+				hostname: item.Config.Hostname,
+				user: item.Config.User,
+				workingDir: item.Config.WorkingDir,
+				entrypoint: item.Config.Entrypoint,
+				cmd: item.Config.Cmd,
+				image: item.Config.Image,
+				labels: item.Config.Labels,
+				env,
+			}
+			: undefined,
+		hostConfig: item?.HostConfig
+			? {
+				networkMode: item.HostConfig.NetworkMode,
+				privileged: item.HostConfig.Privileged,
+				readonlyRootfs: item.HostConfig.ReadonlyRootfs,
+				restartPolicy: item.HostConfig.RestartPolicy,
+				binds: item.HostConfig.Binds,
+			}
+			: undefined,
+		mounts: item?.Mounts,
+		ports: item?.NetworkSettings?.Ports,
+		networks: item?.NetworkSettings?.Networks,
+	};
+}
+
+function curateDockerInspect(items: unknown[]): unknown {
+	return items.map((item: any) => {
+		if (item?.HostConfig || item?.State || item?.NetworkSettings) return redactContainerInspect(item);
+		return redactDockerEnvs(item);
+	});
+}
+
 function sshRoModeNote(target: string, remoteCwd: string): string {
-	return `SSH Read-only Mode active: ${target}\nRemote cwd: ${remoteCwd}\n\nAvailable tools:\n${TOOL_NAMES.join(", ")}\n\nPath notes:\n- Paths are remote paths; relative paths resolve from the remote cwd.\n- ~ is not expanded; use absolute paths like /home/name/... or relative paths from the remote cwd.\n- [blocked] means credential/history/password-manager content is blocked; ask the user to inspect manually if needed.\n- sshro_find shows matching blocked entries but does not descend into blocked directories, so parent searches may not enumerate blocked children.\n- sshro_df defaults to local filesystems only to reduce risk from slow network mounts.`;
+	return `SSH Read-only Mode active: ${target}\nRemote cwd: ${remoteCwd}\n\nAvailable tools:\n${TOOL_NAMES.join(", ")}\n\nPath notes:\n- Paths are remote paths; relative paths resolve from the remote cwd.\n- ~ is not expanded; use absolute paths like /home/name/... or relative paths from the remote cwd.\n- [blocked] means credential/history/password-manager content is blocked; ask the user to inspect manually if needed.\n- sshro_find shows matching blocked entries but does not descend into blocked directories, so parent searches may not enumerate blocked children.\n- sshro_df defaults to local filesystems only to reduce risk from slow network mounts.
+- Docker tools are optional fixed read-only inspections. sshro_docker_inspect returns curated JSON by default and visibly redacts environment variables because Docker metadata can contain secrets.`;
 }
 
 function requireHealthy(): { target: string; remoteCwd: string } {
@@ -298,6 +388,19 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		path: Type.Optional(Type.String({ description: "Optional path/filesystem to inspect" })),
 		localOnly: Type.Optional(Type.Boolean({ description: "Use df -l to avoid remote/network filesystems, default true" })),
 		human: Type.Optional(Type.Boolean({ description: "Human-readable sizes, default true" })),
+	});
+	const dockerPsParams = Type.Object({
+		all: Type.Optional(Type.Boolean({ description: "Include stopped containers, default true" })),
+		name: Type.Optional(Type.String({ description: "Optional Docker name filter substring/pattern" })),
+		limit: Type.Optional(Type.Number({ description: "Maximum containers returned, default 100, max 2000" })),
+	});
+	const dockerInspectParams = Type.Object({
+		target: Type.String({ description: "Docker object name or ID to inspect" }),
+		kind: Type.Optional(Type.Union([Type.Literal("container"), Type.Literal("image"), Type.Literal("network"), Type.Literal("volume")])),
+	});
+	const dockerStatsParams = Type.Object({
+		container: Type.Optional(Type.String({ description: "Optional container name or ID" })),
+		limit: Type.Optional(Type.Number({ description: "Maximum containers returned, default 100, max 2000" })),
 	});
 
 	pi.registerTool({
@@ -583,6 +686,102 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		},
 		renderCall(args, theme) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_df"))} ${theme.fg("accent", args.path ?? "filesystems")}`, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "sshro_docker_ps",
+		label: "sshro_docker_ps",
+		description: "List Docker containers on the SSH Read-only Mode target as JSON. Docker is checked at tool runtime.",
+		promptSnippet: "sshro_docker_ps: List Docker containers as parsed JSON; includes stopped containers by default.",
+		parameters: dockerPsParams,
+		executionMode: "parallel",
+		async execute(_id, params, signal) {
+			try {
+				const { target } = requireHealthy();
+				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 100)));
+				const name = optionalString(params.name);
+				if (name) validateDockerRef(name, "name");
+				const args = [params.all === false ? "" : "--all", "--no-trunc", "--format", "json"].filter(Boolean);
+				if (name) args.push("--filter", `name=${shellQuote(name)}`);
+				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker ps ${args.join(" ")}`;
+				const r = await sshExec(target, script, signal, 20_000);
+				if (r.code !== 0) return textResult(`docker ps failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
+				try {
+					const rows = parseNdjson(r.stdout).slice(0, limit);
+					return textResult(prettyJson(rows));
+				} catch (err) {
+					return textResult(`docker ps JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr, limit)}`, true);
+				}
+			} catch (err) {
+				return textResult(err instanceof Error ? err.message : String(err), true);
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_docker_ps"))} ${theme.fg("accent", args.name ?? "containers")}`, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "sshro_docker_inspect",
+		label: "sshro_docker_inspect",
+		description: "Inspect a Docker object on the SSH Read-only Mode target. Returns curated JSON with environment variables visibly redacted.",
+		promptSnippet: "sshro_docker_inspect: Inspect Docker metadata as JSON; curated output redacts environment variables by default.",
+		parameters: dockerInspectParams,
+		executionMode: "parallel",
+		async execute(_id, params, signal) {
+			try {
+				const { target } = requireHealthy();
+				validateDockerRef(params.target, "target");
+				if (params.kind) validateDockerRef(params.kind, "kind");
+				const args = params.kind ? [`--type`, shellQuote(params.kind), shellQuote(params.target)] : [shellQuote(params.target)];
+				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker inspect ${args.join(" ")}`;
+				const r = await sshExec(target, script, signal, 20_000);
+				if (r.code !== 0) return textResult(`docker inspect failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
+				try {
+					const parsed = JSON.parse(r.stdout);
+					const output = curateDockerInspect(Array.isArray(parsed) ? parsed : [parsed]);
+					return textResult(prettyJson(output));
+				} catch (err) {
+					return textResult(`docker inspect JSON output was unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, true);
+				}
+			} catch (err) {
+				return textResult(err instanceof Error ? err.message : String(err), true);
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_docker_inspect"))} ${theme.fg("accent", args.target ?? "...")}`, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "sshro_docker_stats",
+		label: "sshro_docker_stats",
+		description: "Show one-shot Docker container stats on the SSH Read-only Mode target as JSON where Docker supports it. Never streams.",
+		promptSnippet: "sshro_docker_stats: Show one-shot Docker container CPU/memory/network/block stats; uses --no-stream.",
+		parameters: dockerStatsParams,
+		executionMode: "parallel",
+		async execute(_id, params, signal) {
+			try {
+				const { target } = requireHealthy();
+				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 100)));
+				const container = optionalString(params.container);
+				if (container) validateDockerRef(container, "container");
+				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker stats --no-stream --format '{{json .}}'${container ? ` ${shellQuote(container)}` : ""}`;
+				const r = await sshExec(target, script, signal, 20_000);
+				if (r.code !== 0) return textResult(`docker stats failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
+				try {
+					const rows = parseNdjson(r.stdout).slice(0, limit);
+					return textResult(prettyJson(rows));
+				} catch (err) {
+					return textResult(`docker stats JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr, limit)}`, true);
+				}
+			} catch (err) {
+				return textResult(err instanceof Error ? err.message : String(err), true);
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_docker_stats"))} ${theme.fg("accent", args.container ?? "containers")}`, 0, 0);
 		},
 	});
 }
