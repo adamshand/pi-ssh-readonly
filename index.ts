@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { createFindTool, createGrepTool, createLsTool, createReadTool } from "@mariozechner/pi-coding-agent";
+import { createFindTool, createGrepTool, createLsTool } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import Type from "typebox";
 
@@ -9,8 +9,8 @@ type SshRoState =
 	| { active: true; target: string; remoteCwd: string; fatal: false }
 	| { active: true; target: string; remoteCwd?: string; fatal: true; reason: string };
 
-const TOOL_NAMES = ["sshro_read", "sshro_ls", "sshro_find", "sshro_grep", "sshro_journalctl", "sshro_systemctl", "sshro_ps", "sshro_ss", "sshro_df", "sshro_docker_ps", "sshro_docker_inspect", "sshro_docker_stats"] as const;
-const REQUIRED_REMOTE_COMMANDS = ["file", "find", "grep", "sed", "stat", "ls"];
+const TOOL_NAMES = ["sshro_read", "sshro_ls", "sshro_find", "sshro_grep", "sshro_journalctl", "sshro_systemctl", "sshro_ps", "sshro_ss", "sshro_df", "sshro_docker_ps", "sshro_docker_inspect", "sshro_docker_stats", "sshro_dig"] as const;
+const REQUIRED_REMOTE_COMMANDS = ["file", "find", "grep", "head", "sed", "stat", "tail", "ls"];
 const DEFAULT_LINE_LIMIT = 2000;
 const DEFAULT_BYTE_LIMIT = 50 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -226,6 +226,7 @@ function psHasOnlyHeader(output: string): boolean {
 }
 
 const DOCKER_KINDS = ["container", "image", "network", "volume"] as const;
+const DNS_TYPES = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "PTR", "CAA", "SRV"] as const;
 const SENSITIVE_LABEL_KEY_RE = /(token|secret|password|passwd|key|credential|creds)/i;
 
 function validateDockerRef(value: string, label: string): void {
@@ -255,6 +256,16 @@ function prettyJsonRows(rows: unknown[], limit: number, label: string): string {
 	let output = prettyJson(sliced);
 	if (rows.length > limit) output += `\n\n[ssh-ro output truncated to ${limit} ${label}]`;
 	return output;
+}
+
+function truncateRowsWithHeader(output: string, limit: number, label: string): string {
+	const lines = output.split(/\r?\n/).filter((line) => line.trim().length > 0);
+	if (lines.length <= limit + 1) return output.trimEnd();
+	return `${lines.slice(0, limit + 1).join("\n")}\n\n[ssh-ro output truncated to ${limit} ${label}]`;
+}
+
+function hasOnlyHeader(output: string): boolean {
+	return output.split(/\r?\n/).filter((line) => line.trim().length > 0).length <= 1;
 }
 
 function dockerUnavailableMessage(stderr: string, stdout: string): string {
@@ -301,17 +312,15 @@ function redactDockerEnvs(value: unknown): unknown {
 	return out;
 }
 
-function curateDockerPsRow(row: unknown): unknown {
-	return redactDockerEnvs(row);
-}
-
 function curateDockerInspect(items: unknown[]): unknown {
 	return items.map(redactDockerEnvs);
 }
 
 function sshRoModeNote(target: string, remoteCwd: string): string {
 	return `SSH Read-only Mode active: ${target}\nRemote cwd: ${remoteCwd}\n\nAvailable tools:\n${TOOL_NAMES.join(", ")}\n\nPath notes:\n- Paths are remote paths; relative paths resolve from the remote cwd.\n- ~ is not expanded; use absolute paths like /home/name/... or relative paths from the remote cwd.\n- [blocked] means credential/history/password-manager content is blocked; ask the user to inspect manually if needed.\n- sshro_find shows matching blocked entries but does not descend into blocked directories, so parent searches may not enumerate blocked children.\n- sshro_df defaults to local filesystems only to reduce risk from slow network mounts.
-- Docker tools are optional fixed read-only inspections. sshro_docker_inspect returns curated JSON by default and visibly redacts environment variables because Docker metadata can contain secrets.`;
+- Docker tools are optional fixed read-only inspections. sshro_docker_ps returns compact Docker table output by default; sshro_docker_inspect returns curated JSON and visibly redacts environment variables because Docker metadata can contain secrets.
+- sshro_read supports negative offset values to read from the end of large files using tail.
+- sshro_dig performs fixed, bounded DNS lookups with dig when available on the remote host.`;
 }
 
 function requireHealthy(): { target: string; remoteCwd: string } {
@@ -350,7 +359,11 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	if (toolsRegistered) return;
 	toolsRegistered = true;
 	const cwd = process.cwd();
-	const readParams = createReadTool(cwd).parameters;
+	const readParams = Type.Object({
+		path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
+		offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed). Use a negative value to read from the end of the file, e.g. -100 for the last 100 lines." })),
+		limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+	});
 	const lsParams = createLsTool(cwd).parameters;
 	const findParams = createFindTool(cwd).parameters;
 	const grepParams = createGrepTool(cwd).parameters;
@@ -385,7 +398,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		human: Type.Optional(Type.Boolean({ description: "Human-readable sizes, default true" })),
 	});
 	const dockerPsParams = Type.Object({
-		all: Type.Optional(Type.Boolean({ description: "Include stopped containers, default true" })),
+		all: Type.Optional(Type.Boolean({ description: "Include stopped containers, default false" })),
 		name: Type.Optional(Type.String({ description: "Optional Docker name filter substring/pattern" })),
 		limit: Type.Optional(Type.Number({ description: "Maximum containers returned, default 100, max 2000" })),
 	});
@@ -397,12 +410,18 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		container: Type.Optional(Type.String({ description: "Optional container name or ID" })),
 		limit: Type.Optional(Type.Number({ description: "Maximum containers returned, default 100, max 2000" })),
 	});
+	const digParams = Type.Object({
+		name: Type.String({ description: "DNS name or address to query" }),
+		type: Type.Optional(Type.Union([Type.Literal("A"), Type.Literal("AAAA"), Type.Literal("CNAME"), Type.Literal("MX"), Type.Literal("TXT"), Type.Literal("NS"), Type.Literal("SOA"), Type.Literal("PTR"), Type.Literal("CAA"), Type.Literal("SRV")], { description: "DNS record type, default A" })),
+		server: Type.Optional(Type.String({ description: "Optional DNS server, e.g. 1.1.1.1 or dns.example.com" })),
+		short: Type.Optional(Type.Boolean({ description: "Use dig +short output, default false" })),
+	});
 
 	pi.registerTool({
 		name: "sshro_read",
 		label: "sshro_read",
-		description: "Read a text file from the SSH Read-only Mode target. Supports path, offset, and limit. Binary/non-text files are refused.",
-		promptSnippet: "sshro_read: Read a text file from the SSH Read-only Mode target with optional line offset/limit.",
+		description: "Read a text file from the SSH Read-only Mode target. Supports path, offset, and limit. Negative offset reads from the end of the file. Binary/non-text files are refused.",
+		promptSnippet: "sshro_read: Read a text file from the SSH Read-only Mode target with optional line offset/limit. Use negative offset to read from the end of large logs.",
 		parameters: readParams,
 		executionMode: "parallel",
 		async execute(_id, params, signal) {
@@ -410,11 +429,18 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const { target, remoteCwd } = requireHealthy();
 				const p = remotePath(params.path, remoteCwd);
 				assertPathAllowed(p);
-				const offset = Math.max(1, Math.floor(params.offset ?? 1));
-				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? DEFAULT_LINE_LIMIT)));
-				const end = offset + limit - 1;
+				const rawOffset = params.offset === undefined ? 1 : Math.floor(Number(params.offset));
+				if (!Number.isFinite(rawOffset)) throw new Error("offset must be a number");
+				const offset = rawOffset === 0 ? 1 : rawOffset;
+				const limit = validatePositiveLimit(params.limit, "limit", DEFAULT_LINE_LIMIT);
+				const rangeLabel = offset < 0 ? `last ${Math.abs(offset)} lines${params.limit !== undefined ? `, limited to ${limit}` : ""}` : `${offset}-${offset + limit - 1}`;
+				const readCommand = offset < 0
+					? `tail -n ${Math.abs(offset)} "$p"${params.limit !== undefined ? ` | head -n ${limit}` : ""}`
+					: offset === 1
+						? `head -n ${limit} "$p"`
+						: `tail -n +${offset} "$p" | head -n ${limit}`;
 				const q = shellQuote(p);
-				const script = `p=${q}; if [ ! -e "$p" ]; then echo "not found: $p" >&2; exit 2; fi; if [ ! -f "$p" ]; then echo "not a regular file: $p" >&2; exit 2; fi; if [ ! -r "$p" ]; then echo "not readable: $p" >&2; exit 2; fi; mt=$(file --mime-type -b "$p" 2>/dev/null || true); case "$mt" in text/*|inode/x-empty|application/json|application/xml|application/x-shellscript|application/x-perl|application/x-python|application/javascript|application/x-yaml) ;; *) echo "refusing non-text file ($mt): $p" >&2; exit 3;; esac; printf 'path: %s\\nmime: %s\\nlines: %s-%s\\n---\\n' "$p" "$mt" ${offset} ${end}; sed -n '${offset},${end}p' "$p"`;
+				const script = `p=${q}; if [ ! -e "$p" ]; then echo "not found: $p" >&2; exit 2; fi; if [ ! -f "$p" ]; then echo "not a regular file: $p" >&2; exit 2; fi; if [ ! -r "$p" ]; then echo "not readable: $p" >&2; exit 2; fi; mt=$(file --mime-type -b "$p" 2>/dev/null || true); case "$mt" in text/*|inode/x-empty|application/json|application/xml|application/x-shellscript|application/x-perl|application/x-python|application/javascript|application/x-yaml) ;; *) echo "refusing non-text file ($mt): $p" >&2; exit 3;; esac; printf 'path: %s\\nmime: %s\\nlines: %s\\n---\\n' "$p" "$mt" ${shellQuote(rangeLabel)}; ${readCommand}`;
 				const out = await sshChecked(target, script, signal);
 				return textResult(truncateText(out));
 			} catch (err) {
@@ -687,8 +713,8 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "sshro_docker_ps",
 		label: "sshro_docker_ps",
-		description: "List Docker containers on the SSH Read-only Mode target as JSON. Docker is checked at tool runtime.",
-		promptSnippet: "sshro_docker_ps: List Docker containers as parsed JSON; includes stopped containers by default.",
+		description: "List Docker containers on the SSH Read-only Mode target using compact Docker table output. Docker is checked at tool runtime.",
+		promptSnippet: "sshro_docker_ps: List active Docker containers with docker ps --no-trunc. Use all=true to include stopped/exited containers.",
 		parameters: dockerPsParams,
 		executionMode: "parallel",
 		async execute(_id, params, signal) {
@@ -697,17 +723,15 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const limit = validatePositiveLimit(params.limit, "limit", 100);
 				const name = optionalString(params.name);
 				if (name) validateDockerRef(name, "name");
-				const args = [params.all === false ? "" : "--all", "--no-trunc", "--format", "json"].filter(Boolean);
-				if (name) args.push("--filter", `name=${shellQuote(name)}`);
+				const args = [params.all ? "--all" : "", "--no-trunc"].filter(Boolean);
+				if (name) args.push("--filter", shellQuote(`name=${name}`));
 				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker ps ${args.join(" ")}`;
 				const r = await sshExec(target, script, signal, 20_000);
 				if (r.code !== 0) return textResult(`docker ps failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
-				try {
-					const rows = parseNdjson(r.stdout).map(curateDockerPsRow);
-					return textResult(prettyJsonRows(rows, limit, "containers"));
-				} catch (err) {
-					return textResult(`docker ps JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, true);
+				if (hasOnlyHeader(r.stdout)) {
+					return textResult(params.all ? "No Docker containers found." : "No active Docker containers. Use all=true to include stopped/exited containers.");
 				}
+				return textResult(truncateRowsWithHeader(r.stdout, limit, "containers"));
 			} catch (err) {
 				return textResult(err instanceof Error ? err.message : String(err), true);
 			}
@@ -754,7 +778,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		name: "sshro_docker_stats",
 		label: "sshro_docker_stats",
 		description: "Show one-shot Docker container stats on the SSH Read-only Mode target as JSON where Docker supports it. Never streams.",
-		promptSnippet: "sshro_docker_stats: Show one-shot Docker container CPU/memory/network/block stats; uses --no-stream.",
+		promptSnippet: "sshro_docker_stats: Show one-shot Docker container CPU/memory/network/block stats; uses --no-stream. CPU can be noisy; call again a few seconds later to compare.",
 		parameters: dockerStatsParams,
 		executionMode: "parallel",
 		async execute(_id, params, signal) {
@@ -778,6 +802,37 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		},
 		renderCall(args, theme) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_docker_stats"))} ${theme.fg("accent", args.container ?? "containers")}`, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "sshro_dig",
+		label: "sshro_dig",
+		description: "Run a bounded read-only DNS lookup from the SSH Read-only Mode target using dig. dig is checked at tool runtime.",
+		promptSnippet: "sshro_dig: Debug DNS resolution from the remote host using dig +time=3 +tries=1. Optional server uses @server; short=true uses +short.",
+		parameters: digParams,
+		executionMode: "parallel",
+		async execute(_id, params, signal) {
+			try {
+				const { target } = requireHealthy();
+				const name = optionalString(params.name);
+				if (!name) throw new Error("name is required");
+				validatePathLike(name, "name");
+				const type = optionalString(params.type) ?? "A";
+				if (!(DNS_TYPES as readonly string[]).includes(type)) throw new Error(`type must be one of: ${DNS_TYPES.join(", ")}`);
+				const server = optionalString(params.server);
+				if (server) validatePathLike(server, "server");
+				const args = ["+time=3", "+tries=1", params.short ? "+short" : "", server ? shellQuote(`@${server}`) : "", shellQuote(name), shellQuote(type)].filter(Boolean);
+				const script = `command -v dig >/dev/null 2>&1 || { echo 'dig not found on remote host' >&2; exit 127; }; dig ${args.join(" ")}`;
+				const r = await sshExec(target, script, signal, 10_000);
+				const output = r.stdout + r.stderr;
+				return textResult(output.trim().length ? truncateText(output, 500) : "No DNS answer", r.code !== 0);
+			} catch (err) {
+				return textResult(err instanceof Error ? err.message : String(err), true);
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_dig"))} ${theme.fg("accent", args.name ?? "...")}`, 0, 0);
 		},
 	});
 }
