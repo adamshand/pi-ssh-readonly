@@ -258,8 +258,7 @@ function prettyJsonRows(rows: unknown[], limit: number, label: string): string {
 }
 
 function dockerUnavailableMessage(stderr: string, stdout: string): string {
-	const message = `${stderr}${stdout}`.trim();
-	return message.length ? message : "Docker command failed without output";
+	return stderr.trim() || stdout.trim() || "Docker command failed without output";
 }
 
 function redactLabelValue(value: unknown): unknown {
@@ -302,80 +301,12 @@ function redactDockerEnvs(value: unknown): unknown {
 	return out;
 }
 
-function curateDockerPsRow(row: any): unknown {
-	return {
-		id: row.ID ?? row.Id ?? row.ContainerID,
-		image: row.Image,
-		command: row.Command,
-		createdAt: row.CreatedAt ?? row.Created,
-		runningFor: row.RunningFor,
-		ports: row.Ports,
-		state: row.State,
-		status: row.Status,
-		size: row.Size,
-		names: row.Names ?? row.Name,
-		labels: redactDockerLabels(row.Labels),
-		mounts: row.Mounts,
-		networks: row.Networks,
-	};
-}
-
-function redactContainerInspect(item: any): unknown {
-	const env = Array.isArray(item?.Config?.Env) ? (item.Config.Env.length > 0 ? "[redacted]" : []) : item?.Config?.Env == null ? null : "[redacted]";
-	return {
-		id: item?.Id,
-		name: item?.Name,
-		image: item?.Image,
-		created: item?.Created,
-		state: item?.State
-			? {
-				status: item.State.Status,
-				running: item.State.Running,
-				paused: item.State.Paused,
-				restarting: item.State.Restarting,
-				oomKilled: item.State.OOMKilled,
-				dead: item.State.Dead,
-				pid: item.State.Pid,
-				exitCode: item.State.ExitCode,
-				error: item.State.Error,
-				startedAt: item.State.StartedAt,
-				finishedAt: item.State.FinishedAt,
-			}
-			: undefined,
-		restartCount: item?.RestartCount,
-		restartPolicy: item?.HostConfig?.RestartPolicy,
-		config: item?.Config
-			? {
-				hostname: item.Config.Hostname,
-				user: item.Config.User,
-				workingDir: item.Config.WorkingDir,
-				entrypoint: item.Config.Entrypoint,
-				cmd: item.Config.Cmd,
-				image: item.Config.Image,
-				labels: redactDockerLabels(item.Config.Labels),
-				env,
-			}
-			: undefined,
-		hostConfig: item?.HostConfig
-			? {
-				networkMode: item.HostConfig.NetworkMode,
-				privileged: item.HostConfig.Privileged,
-				readonlyRootfs: item.HostConfig.ReadonlyRootfs,
-				restartPolicy: item.HostConfig.RestartPolicy,
-				binds: item.HostConfig.Binds,
-			}
-			: undefined,
-		mounts: item?.Mounts,
-		ports: item?.NetworkSettings?.Ports,
-		networks: item?.NetworkSettings?.Networks,
-	};
+function curateDockerPsRow(row: unknown): unknown {
+	return redactDockerEnvs(row);
 }
 
 function curateDockerInspect(items: unknown[]): unknown {
-	return items.map((item: any) => {
-		if (item?.HostConfig || item?.State || item?.NetworkSettings) return redactContainerInspect(item);
-		return redactDockerEnvs(item);
-	});
+	return items.map(redactDockerEnvs);
 }
 
 function sshRoModeNote(target: string, remoteCwd: string): string {
