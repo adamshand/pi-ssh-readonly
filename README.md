@@ -22,6 +22,12 @@ This extension disables all built in tools and adds a new set of read only tools
 
 ⚠️ ⚠️ ⚠️  This is extension is vibe coded.  **Use at your own risk.**  It's working well for me, and hasn't eaten anyones homework yet. 🤞 🤞
 
+## Install
+
+```
+pi install git:git@github.com:adamshand/pi-ssh-readonly
+```
+
 ## Usage
 
 You must start a new `pi` session the `--ssh-ro` argument, eg.
