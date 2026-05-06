@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { createFindTool, createGrepTool, createLsTool } from "@mariozechner/pi-coding-agent";
+import { createLsTool } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import Type from "typebox";
 
@@ -220,6 +220,27 @@ function markBlockedFindEntries(output: string): string {
 	return appendBlockedFootnote(marked);
 }
 
+function summarizeSearchErrors(stderr: string, showErrors: boolean, errorLimit: number): string {
+	const lines = stderr.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+	if (lines.length === 0) return "";
+	const permission = lines.filter((line) => /permission denied/i.test(line));
+	const other = lines.filter((line) => !/permission denied/i.test(line));
+	const notes: string[] = [];
+	if (permission.length > 0) notes.push(`[ssh-ro note] ${permission.length} paths skipped: permission denied`);
+	if (other.length > 0) notes.push(`[ssh-ro note] ${other.length} search errors${showErrors ? ":" : " omitted; use showErrors=true to include details"}`);
+	if (showErrors) {
+		const shown = lines.slice(0, errorLimit);
+		notes.push("[ssh-ro errors]", ...shown);
+		if (lines.length > shown.length) notes.push(`[ssh-ro note] ${lines.length - shown.length} additional errors omitted`);
+	}
+	return notes.join("\n");
+}
+
+function appendSearchErrorSummary(output: string, stderr: string, showErrors: boolean, errorLimit: number): string {
+	const summary = summarizeSearchErrors(stderr, showErrors, errorLimit);
+	return summary ? `${output.trimEnd()}\n\n${summary}`.trim() : output;
+}
+
 function psHasOnlyHeader(output: string): boolean {
 	const lines = output.split(/\r?\n/).filter((line) => line.trim().length > 0);
 	return lines.length === 1 && /^\s*PID\s+PPID\s+USER\s+STAT\s+ELAPSED\s+%CPU\s+%MEM\s+COMMAND/.test(lines[0]);
@@ -365,8 +386,24 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
 	});
 	const lsParams = createLsTool(cwd).parameters;
-	const findParams = createFindTool(cwd).parameters;
-	const grepParams = createGrepTool(cwd).parameters;
+	const findParams = Type.Object({
+		path: Type.Optional(Type.String({ description: "Directory path to search from, default remote cwd" })),
+		pattern: Type.String({ description: "File name/path glob. Patterns without '/' match names; patterns with '/' match paths." }),
+		limit: Type.Optional(Type.Number({ description: "Maximum matches returned, default 500, max 2000" })),
+		showErrors: Type.Optional(Type.Boolean({ description: "Include detailed search errors, default false. Permission errors are summarized either way." })),
+		errorLimit: Type.Optional(Type.Number({ description: "Maximum detailed error lines when showErrors=true, default 20, max 2000" })),
+	});
+	const grepParams = Type.Object({
+		path: Type.String({ description: "File or directory path to search" }),
+		pattern: Type.String({ description: "Extended regular expression to search for by default; use literal=true for fixed-string search" }),
+		glob: Type.Optional(Type.String({ description: "Optional filename glob for recursive directory search, e.g. *.log" })),
+		ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search" })),
+		literal: Type.Optional(Type.Boolean({ description: "Use fixed-string grep -F instead of extended regex grep -E" })),
+		context: Type.Optional(Type.Number({ description: "Context lines before/after each match, max 20" })),
+		limit: Type.Optional(Type.Number({ description: "Maximum matching output lines, default 500, max 2000" })),
+		showErrors: Type.Optional(Type.Boolean({ description: "Include detailed search errors, default false. Permission errors are summarized either way." })),
+		errorLimit: Type.Optional(Type.Number({ description: "Maximum detailed error lines when showErrors=true, default 20, max 2000" })),
+	});
 	const journalctlParams = Type.Object({
 		unit: Type.Optional(Type.String({ description: "systemd unit to filter, e.g. nginx.service" })),
 		since: Type.Optional(Type.String({ description: "journalctl --since value, e.g. '1 hour ago'" })),
@@ -491,16 +528,19 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const { target, remoteCwd } = requireHealthy();
 				validatePathLike(params.pattern, "pattern");
 				const base = remotePath(params.path, remoteCwd);
-				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 500)));
+				const limit = validatePositiveLimit(params.limit, "limit", 500);
+				const showErrors = params.showErrors === true;
+				const errorLimit = validatePositiveLimit(params.errorLimit, "errorLimit", 20);
 				const pathPattern = params.pattern.includes("/") && !params.pattern.startsWith("/") ? `*/${params.pattern}` : params.pattern;
 				const pred = params.pattern.includes("/") ? `-path ${shellQuote(pathPattern)}` : `-name ${shellQuote(params.pattern)}`;
 				if (denyReasonForPath(base)) return textResult(appendBlockedFootnote(`${base} [blocked]`));
 				const shouldPrune = !base.includes("/.git") && !base.includes("/node_modules") && !denyReasonForPath(`${base}/placeholder`);
 				const prune = shouldPrune ? findMarkedDenyExpression(pred) : "";
-				const script = `find ${shellQuote(base)} ${prune}${pred} -print 2>&1 | sed -n '1,${limit}p'`;
+				const script = `find ${shellQuote(base)} ${prune}${pred} -print | sed -n '1,${limit}p'`;
 				const r = await sshExec(target, script, signal, 45_000);
-				const output = markBlockedFindEntries(r.stdout + r.stderr);
-				return textResult(output.trim().length ? truncateText(output, limit) : "No matches", r.code !== 0 && r.stdout.trim().length === 0);
+				const matches = markBlockedFindEntries(r.stdout);
+				const output = matches.trim().length ? truncateText(matches, limit) : "No matches";
+				return textResult(appendSearchErrorSummary(output, r.stderr, showErrors, errorLimit), r.code !== 0 && r.stdout.trim().length === 0 && r.stderr.trim().length === 0);
 			} catch (err) {
 				return textResult(err instanceof Error ? err.message : String(err), true);
 			}
@@ -513,8 +553,8 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "sshro_grep",
 		label: "sshro_grep",
-		description: "Search remote files on the SSH Read-only Mode target. Recursive for directories, skips binary files, supports glob, ignoreCase, literal, context, and limit.",
-		promptSnippet: "sshro_grep: Search text files on the SSH Read-only Mode target; recursive directory searches prune .git and node_modules by default.",
+		description: "Search remote files on the SSH Read-only Mode target. Recursive for directories, skips binary files, uses extended regex by default, and supports glob, ignoreCase, literal, context, and limit.",
+		promptSnippet: "sshro_grep: Search text files on the SSH Read-only Mode target using grep -E by default; use literal=true for grep -F. Recursive directory searches prune .git and node_modules by default and summarize permission errors unless showErrors=true.",
 		parameters: grepParams,
 		executionMode: "parallel",
 		async execute(_id, params, signal) {
@@ -523,20 +563,22 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				validatePathLike(params.pattern, "pattern");
 				if (params.glob) validatePathLike(params.glob, "glob");
 				const base = remotePath(params.path, remoteCwd);
-				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 500)));
+				const limit = validatePositiveLimit(params.limit, "limit", 500);
+				const showErrors = params.showErrors === true;
+				const errorLimit = validatePositiveLimit(params.errorLimit, "errorLimit", 20);
 				const opts = ["-nH", "-I"];
 				if (params.ignoreCase) opts.push("-i");
-				if (params.literal) opts.push("-F");
+				opts.push(params.literal ? "-F" : "-E");
 				if (params.context !== undefined) opts.push("-C", String(Math.max(0, Math.min(20, Math.floor(params.context)))));
 				const globPred = params.glob ? ` -name ${shellQuote(params.glob)}` : "";
 				assertPathAllowed(base);
 				const shouldPrune = !base.includes("/.git") && !base.includes("/node_modules") && !denyReasonForPath(`${base}/placeholder`);
 				const prune = shouldPrune ? findDenyExpression() : "";
 				const fileDeny = findFileDenyPredicates();
-				const script = `if [ -d ${shellQuote(base)} ]; then find ${shellQuote(base)} ${prune}-type f ${fileDeny}${globPred} -exec grep ${opts.join(" ")} -- ${shellQuote(params.pattern)} {} + 2>&1 | sed -n '1,${limit}p'; else grep ${opts.join(" ")} -- ${shellQuote(params.pattern)} ${shellQuote(base)} 2>&1 | sed -n '1,${limit}p'; fi`;
+				const script = `if [ -d ${shellQuote(base)} ]; then find ${shellQuote(base)} ${prune}-type f ${fileDeny}${globPred} -exec grep ${opts.join(" ")} -- ${shellQuote(params.pattern)} {} + | sed -n '1,${limit}p'; else grep ${opts.join(" ")} -- ${shellQuote(params.pattern)} ${shellQuote(base)} | sed -n '1,${limit}p'; fi`;
 				const r = await sshExec(target, script, signal, 60_000);
-				const output = r.stdout + r.stderr;
-				return textResult(output.trim().length ? truncateText(output, limit) : "No matches");
+				const output = r.stdout.trim().length ? truncateText(r.stdout, limit) : "No matches";
+				return textResult(appendSearchErrorSummary(output, r.stderr, showErrors, errorLimit));
 			} catch (err) {
 				return textResult(err instanceof Error ? err.message : String(err), true);
 			}

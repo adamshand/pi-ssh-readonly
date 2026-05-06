@@ -52,7 +52,7 @@ Host *
   ControlPersist 900
 ```
 
-`index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. .env, shell history files, SSH/cloud credential directories, password-manager data, chezmoi data). Listings and find results still show blocked entries with a compact `[blocked]` marker so the agent knows they exist and can ask for help if needed. `sshro_find` does not descend into blocked directories, so parent searches may not enumerate blocked children. If you have specific requirements edit this.
+`index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. .env, shell history files, SSH/cloud credential directories, password-manager data, chezmoi data). Listings and find results still show blocked entries with a compact `[blocked]` marker so the agent knows they exist and can ask for help if needed. `sshro_find` does not descend into blocked directories, so parent searches may not enumerate blocked children. Recursive `sshro_find`/`sshro_grep` summarize permission errors by default so errors do not consume match budget; use `showErrors=true` for details. `sshro_grep` uses extended regex (`grep -E`) by default; use `literal=true` for fixed-string search. If you have specific requirements edit this.
 
 `sshro_read` supports negative `offset` values for efficient tail-style reads of large files, e.g. `offset=-100` reads the last 100 lines using remote `tail`.
 
