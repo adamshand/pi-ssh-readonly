@@ -225,8 +225,17 @@ function psHasOnlyHeader(output: string): boolean {
 	return lines.length === 1 && /^\s*PID\s+PPID\s+USER\s+STAT\s+ELAPSED\s+%CPU\s+%MEM\s+COMMAND/.test(lines[0]);
 }
 
+const DOCKER_KINDS = ["container", "image", "network", "volume"] as const;
+const SENSITIVE_LABEL_KEY_RE = /(token|secret|password|passwd|key|credential|creds)/i;
+
 function validateDockerRef(value: string, label: string): void {
 	validatePathLike(value, label);
+}
+
+function validatePositiveLimit(value: unknown, label: string, defaultValue: number): number {
+	const limit = value === undefined ? defaultValue : Math.floor(Number(value));
+	if (!Number.isFinite(limit) || limit < 1) throw new Error(`${label} must be >= 1`);
+	return Math.min(DEFAULT_LINE_LIMIT, limit);
 }
 
 function parseNdjson(output: string): unknown[] {
@@ -241,9 +250,43 @@ function prettyJson(value: unknown, maxLines = DEFAULT_LINE_LIMIT): string {
 	return truncateText(JSON.stringify(value, null, 2), maxLines);
 }
 
+function prettyJsonRows(rows: unknown[], limit: number, label: string): string {
+	const sliced = rows.slice(0, limit);
+	let output = prettyJson(sliced);
+	if (rows.length > limit) output += `\n\n[ssh-ro output truncated to ${limit} ${label}]`;
+	return output;
+}
+
 function dockerUnavailableMessage(stderr: string, stdout: string): string {
 	const message = `${stderr}${stdout}`.trim();
 	return message.length ? message : "Docker command failed without output";
+}
+
+function redactLabelValue(value: unknown): unknown {
+	if (value === undefined || value === null || value === "") return value;
+	return "[redacted]";
+}
+
+function redactDockerLabels(labels: unknown): unknown {
+	if (!labels) return labels;
+	if (typeof labels === "string") {
+		return labels
+			.split(",")
+			.map((entry) => {
+				const [key, ...rest] = entry.split("=");
+				if (!key || rest.length === 0) return entry;
+				return SENSITIVE_LABEL_KEY_RE.test(key) ? `${key}=[redacted]` : entry;
+			})
+			.join(",");
+	}
+	if (typeof labels === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [key, value] of Object.entries(labels as Record<string, unknown>)) {
+			out[key] = SENSITIVE_LABEL_KEY_RE.test(key) ? redactLabelValue(value) : value;
+		}
+		return out;
+	}
+	return labels;
 }
 
 function redactDockerEnvs(value: unknown): unknown {
@@ -251,9 +294,30 @@ function redactDockerEnvs(value: unknown): unknown {
 	if (!value || typeof value !== "object") return value;
 	const out: Record<string, unknown> = {};
 	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-		out[key] = key === "Env" ? (Array.isArray(child) && child.length > 0 ? "[redacted]" : child ?? null) : redactDockerEnvs(child);
+		if (key === "Env") out[key] = Array.isArray(child) && child.length > 0 ? "[redacted]" : child ?? null;
+		else if (key === "Labels") out[key] = redactDockerLabels(child);
+		else if (key === "GraphDriver" && child && typeof child === "object") out[key] = { ...(child as Record<string, unknown>), Data: "[omitted]" };
+		else out[key] = redactDockerEnvs(child);
 	}
 	return out;
+}
+
+function curateDockerPsRow(row: any): unknown {
+	return {
+		id: row.ID ?? row.Id ?? row.ContainerID,
+		image: row.Image,
+		command: row.Command,
+		createdAt: row.CreatedAt ?? row.Created,
+		runningFor: row.RunningFor,
+		ports: row.Ports,
+		state: row.State,
+		status: row.Status,
+		size: row.Size,
+		names: row.Names ?? row.Name,
+		labels: redactDockerLabels(row.Labels),
+		mounts: row.Mounts,
+		networks: row.Networks,
+	};
 }
 
 function redactContainerInspect(item: any): unknown {
@@ -288,7 +352,7 @@ function redactContainerInspect(item: any): unknown {
 				entrypoint: item.Config.Entrypoint,
 				cmd: item.Config.Cmd,
 				image: item.Config.Image,
-				labels: item.Config.Labels,
+				labels: redactDockerLabels(item.Config.Labels),
 				env,
 			}
 			: undefined,
@@ -396,7 +460,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	});
 	const dockerInspectParams = Type.Object({
 		target: Type.String({ description: "Docker object name or ID to inspect" }),
-		kind: Type.Optional(Type.Union([Type.Literal("container"), Type.Literal("image"), Type.Literal("network"), Type.Literal("volume")])),
+		kind: Type.Optional(Type.String({ description: "Optional Docker object kind: container, image, network, or volume" })),
 	});
 	const dockerStatsParams = Type.Object({
 		container: Type.Optional(Type.String({ description: "Optional container name or ID" })),
@@ -699,7 +763,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		async execute(_id, params, signal) {
 			try {
 				const { target } = requireHealthy();
-				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 100)));
+				const limit = validatePositiveLimit(params.limit, "limit", 100);
 				const name = optionalString(params.name);
 				if (name) validateDockerRef(name, "name");
 				const args = [params.all === false ? "" : "--all", "--no-trunc", "--format", "json"].filter(Boolean);
@@ -708,10 +772,10 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const r = await sshExec(target, script, signal, 20_000);
 				if (r.code !== 0) return textResult(`docker ps failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
 				try {
-					const rows = parseNdjson(r.stdout).slice(0, limit);
-					return textResult(prettyJson(rows));
+					const rows = parseNdjson(r.stdout).map(curateDockerPsRow);
+					return textResult(prettyJsonRows(rows, limit, "containers"));
 				} catch (err) {
-					return textResult(`docker ps JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr, limit)}`, true);
+					return textResult(`docker ps JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, true);
 				}
 			} catch (err) {
 				return textResult(err instanceof Error ? err.message : String(err), true);
@@ -733,8 +797,9 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 			try {
 				const { target } = requireHealthy();
 				validateDockerRef(params.target, "target");
-				if (params.kind) validateDockerRef(params.kind, "kind");
-				const args = params.kind ? [`--type`, shellQuote(params.kind), shellQuote(params.target)] : [shellQuote(params.target)];
+				const kind = optionalString(params.kind);
+				if (kind && !(DOCKER_KINDS as readonly string[]).includes(kind)) throw new Error(`kind must be one of: ${DOCKER_KINDS.join(", ")}`);
+				const args = kind ? [`--type`, shellQuote(kind), shellQuote(params.target)] : [shellQuote(params.target)];
 				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker inspect ${args.join(" ")}`;
 				const r = await sshExec(target, script, signal, 20_000);
 				if (r.code !== 0) return textResult(`docker inspect failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
@@ -764,17 +829,17 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		async execute(_id, params, signal) {
 			try {
 				const { target } = requireHealthy();
-				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 100)));
+				const limit = validatePositiveLimit(params.limit, "limit", 100);
 				const container = optionalString(params.container);
 				if (container) validateDockerRef(container, "container");
 				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker stats --no-stream --format '{{json .}}'${container ? ` ${shellQuote(container)}` : ""}`;
 				const r = await sshExec(target, script, signal, 20_000);
 				if (r.code !== 0) return textResult(`docker stats failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
 				try {
-					const rows = parseNdjson(r.stdout).slice(0, limit);
-					return textResult(prettyJson(rows));
+					const rows = parseNdjson(r.stdout);
+					return textResult(prettyJsonRows(rows, limit, "stat rows"));
 				} catch (err) {
-					return textResult(`docker stats JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr, limit)}`, true);
+					return textResult(`docker stats JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, true);
 				}
 			} catch (err) {
 				return textResult(err instanceof Error ? err.message : String(err), true);

@@ -54,6 +54,8 @@ Prefer JSON for Docker tools where Docker supports it natively.
 - Use native `--format json` where available.
 - Parse NDJSON/JSON locally in the extension when possible.
 - Return pretty-printed JSON arrays/objects to the agent.
+- Reject row limits below 1 with a clear `limit must be >= 1` error.
+- Append an explicit `[ssh-ro output truncated ...]` note when Docker row output is limited.
 - Avoid requiring remote `jq`.
 - Do not add table/text fallback for `sshro_docker_ps`; if expected JSON output is unavailable, return a clear error message.
 
@@ -93,9 +95,15 @@ If `name` is provided, prefer Docker's filter:
 
 ### Output
 
-Output: JSON array parsed from Docker's NDJSON rows.
+Output: JSON array parsed from Docker's NDJSON rows, normalized to lower-case/camel-ish keys. Preserve Docker command strings, include Docker's mount summary, and redact label values whose keys look sensitive (`token`, `secret`, `password`, `key`, `credential`, etc.).
 
 If `--format json` unexpectedly fails or output cannot be parsed as NDJSON, return a clear tool error explaining that Docker JSON output was unavailable/unparseable. Do not fall back to table output for `sshro_docker_ps`.
+
+If `limit` is smaller than the number of returned rows, append a note such as:
+
+```text
+[ssh-ro output truncated to 10 containers]
+```
 
 ### Timeout
 
@@ -183,9 +191,13 @@ For container-like objects, include:
 
 Always redact `Config.Env` from curated output. Show an explicit marker such as `"env": "[redacted]"` when environment variables are present, or `"env": []` / `"env": null` when Docker reports none. There is intentionally no `includeEnv` parameter in v1; if env values are needed, the agent should ask the human operator to inspect them manually.
 
+Redact Docker label values whose keys look sensitive (`token`, `secret`, `password`, `key`, `credential`, etc.). Omit image `GraphDriver.Data` because it exposes Docker storage internals such as `/var/lib/docker/overlay2/...` paths.
+
+Container inspect output is normalized to lower-case/camel-ish keys. Image, network, and volume inspect output may preserve Docker's native shape after redaction/omission. This should be documented clearly so the agent understands which outputs are normalized versus Docker-shaped.
+
 ### Secret considerations
 
-`docker inspect` can expose secrets in environment variables, labels, command arguments, mount paths, and image metadata. The default curated output always redacts environment variable values and visibly marks that redaction, but this reduces rather than eliminates secret-exposure risk.
+`docker inspect` can expose secrets in environment variables, labels, command arguments, mount paths, topology, and image metadata. Curated output always redacts environment variable values and visibly marks that redaction, redacts sensitive-looking label values, and omits image storage internals, but this reduces rather than eliminates secret-exposure risk. Volume inspect may expose mountpoints. Network inspect may expose internal IP/MAC/container mappings.
 
 ### Timeout
 
@@ -218,13 +230,15 @@ Never run streaming `docker stats`.
 
 ### Output
 
-Preferred output: JSON array parsed from Docker's NDJSON rows.
+Output: JSON array parsed from Docker's NDJSON rows.
 
-Fallback output: bounded table/text from:
+If `limit` is smaller than the number of returned rows, append a note such as:
 
-```sh
-docker stats --no-stream [container]
+```text
+[ssh-ro output truncated to 10 stat rows]
 ```
+
+If stats JSON output is unavailable or unparseable, return a clear tool error.
 
 ### Timeout
 
@@ -244,6 +258,7 @@ Add the tools to the README tool list and document:
 
 - Docker is optional and checked at tool runtime.
 - Docker permission errors are returned as tool errors.
+- `sshro_docker_ps` normalizes Docker rows, preserves command strings, includes Docker's mount summary, redacts sensitive labels, and appends truncation notes when row-limited.
 - `sshro_docker_inspect` returns curated JSON by default and visibly redacts environment variables.
 - `sshro_docker_stats` uses `--no-stream` only.
 
@@ -254,6 +269,7 @@ Add domain statements:
 - Docker tools are optional runtime diagnostics and are not part of startup health checks.
 - Docker tools use native Docker JSON where available and parse/pretty-print locally.
 - `sshro_docker_inspect` curates output by default and visibly redacts environment variable values; v1 has no parameter to reveal env values in curated output.
+- Docker label values with sensitive-looking keys are redacted, image `GraphDriver.Data` is omitted, and volume/network inspect output may reveal mountpoints/topology.
 - Docker stats are one-shot only.
 
 ## Acceptance criteria
@@ -262,9 +278,10 @@ Add domain statements:
 - `--ssh-ro` active sessions expose the three Docker tools and still block all other tools.
 - Startup succeeds on hosts without Docker if the original required commands are present.
 - Each Docker tool returns a clear error if Docker is absent or permission-denied.
-- `sshro_docker_ps` returns JSON array output when Docker JSON templates work.
+- `sshro_docker_ps` returns normalized JSON array output when Docker JSON templates work, rejects `limit < 1`, and appends row-truncation notes.
 - `sshro_docker_inspect` returns curated pretty JSON and visibly marks `Config.Env` values as redacted; there is no option to reveal env values.
-- `sshro_docker_stats` uses `--no-stream` and returns JSON array output when Docker JSON templates work.
+- Invalid `sshro_docker_inspect.kind` values return `kind must be one of: container, image, network, volume`.
+- `sshro_docker_stats` uses `--no-stream`, returns JSON array output when Docker JSON templates work, rejects `limit < 1`, and appends row-truncation notes.
 - No Docker tool accepts arbitrary Docker subcommands or shell fragments.
 - `node --check index.ts` passes.
 - `git diff --check` passes.

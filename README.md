@@ -53,7 +53,7 @@ Host *
 
 `index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. .env, shell history files, SSH/cloud credential directories, password-manager data, chezmoi data). Listings and find results still show blocked entries with a compact `[blocked]` marker so the agent knows they exist and can ask for help if needed. `sshro_find` does not descend into blocked directories, so parent searches may not enumerate blocked children. If you have specific requirements edit this.
 
-Docker tools are optional and checked when the tool runs, not at startup. `sshro_docker_ps` and `sshro_docker_stats` return parsed JSON. `sshro_docker_inspect` returns curated JSON by default and visibly redacts container environment variables because Docker metadata can contain secrets. `sshro_docker_stats` always uses one-shot `--no-stream` mode.
+Docker tools are optional and checked when the tool runs, not at startup. `sshro_docker_ps` and `sshro_docker_stats` return parsed JSON and reject `limit` values below 1. If output is row-limited, they append an `[ssh-ro output truncated ...]` note. `sshro_docker_inspect` returns curated JSON and visibly redacts environment variables because Docker metadata can contain secrets. Docker labels with sensitive-looking keys are redacted, image `GraphDriver.Data` is omitted, and Docker mountpoints/network topology may be visible. `sshro_docker_stats` always uses one-shot `--no-stream` mode.
 
 ## Known Issues
 
