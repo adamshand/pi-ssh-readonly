@@ -22,6 +22,7 @@ const DENIED_FILE_PREFIXES = [".env.", "terraform.tfstate."];
 
 let state: SshRoState = { active: false };
 let toolsRegistered = false;
+let previousActiveTools: string[] | undefined;
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -136,7 +137,7 @@ function sshExec(target: string, command: string, signal?: AbortSignal, timeoutM
 		const remoteCommand = `sh -c ${shellQuote(command)}`;
 		const child = spawn(
 			"ssh",
-			["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, remoteCommand],
+			["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", target, remoteCommand],
 			{ stdio: ["ignore", "pipe", "pipe"] },
 		);
 		const stdout: Buffer[] = [];
@@ -886,10 +887,62 @@ function failClosed(pi: ExtensionAPI, ctx: ExtensionContext, target: string, rea
 	ctx.ui.notify(`SSH Read-only Mode startup failed for ${target}: ${reason}`, "error");
 }
 
+async function activateSshRo(pi: ExtensionAPI, ctx: ExtensionContext, target: string): Promise<void> {
+	if (state.active && !state.fatal) {
+		throw new Error(`SSH Read-only Mode is already active for ${state.target}. Run /sshro logout first.`);
+	}
+	validateTarget(target);
+	registerSshRoTools(pi);
+	const remoteCwd = await startupCheck(target);
+	previousActiveTools = pi.getActiveTools();
+	state = { active: true, target, remoteCwd, fatal: false };
+	pi.setActiveTools([...TOOL_NAMES]);
+	ctx.ui.setStatus("ssh-ro", ctx.ui.theme.fg("accent", `SSH RO ${target}`));
+	ctx.ui.notify(`SSH Read-only Mode: ${target} (remote cwd ${remoteCwd})`, "info");
+	pi.sendMessage({
+		customType: "ssh-ro-info",
+		content: sshRoModeNote(target, remoteCwd),
+		display: true,
+		details: { target, remoteCwd, tools: TOOL_NAMES },
+	});
+}
+
+function deactivateSshRo(pi: ExtensionAPI, ctx: ExtensionContext): void {
+	if (!state.active) {
+		ctx.ui.notify("SSH Read-only Mode is not active", "info");
+		return;
+	}
+	state = { active: false };
+	if (previousActiveTools) pi.setActiveTools(previousActiveTools);
+	previousActiveTools = undefined;
+	ctx.ui.setStatus("ssh-ro", undefined);
+	ctx.ui.notify("SSH Read-only Mode ended", "info");
+}
+
 export default function sshReadonlyExtension(pi: ExtensionAPI) {
 	pi.registerFlag("ssh-ro", {
 		type: "string",
 		description: "Start SSH Read-only Mode against an SSH target, e.g. pi --ssh-ro user@server",
+	});
+
+	pi.registerCommand("sshro", {
+		description: "Enter SSH Read-only Mode for a known SSH host, or leave it with /sshro logout",
+		handler: async (args, ctx) => {
+			const value = (args ?? "").trim();
+			if (value === "logout") {
+				deactivateSshRo(pi, ctx);
+				return;
+			}
+			if (!value) {
+				ctx.ui.notify("Usage: /sshro user@host  or  /sshro logout", "info");
+				return;
+			}
+			try {
+				await activateSshRo(pi, ctx, value);
+			} catch (err) {
+				ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+			}
+		},
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -900,20 +953,7 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 		}
 
 		try {
-			const target = raw.trim();
-			validateTarget(target);
-			registerSshRoTools(pi);
-			const remoteCwd = await startupCheck(target);
-			state = { active: true, target, remoteCwd, fatal: false };
-			pi.setActiveTools([...TOOL_NAMES]);
-			ctx.ui.setStatus("ssh-ro", ctx.ui.theme.fg("accent", `SSH RO ${target}:${remoteCwd}`));
-			ctx.ui.notify(`SSH Read-only Mode: ${target}:${remoteCwd}`, "info");
-			pi.sendMessage({
-				customType: "ssh-ro-info",
-				content: sshRoModeNote(target, remoteCwd),
-				display: true,
-				details: { target, remoteCwd, tools: TOOL_NAMES },
-			});
+			await activateSshRo(pi, ctx, raw.trim());
 		} catch (err) {
 			const target = typeof raw === "string" ? raw.trim() : "<unknown>";
 			failClosed(pi, ctx, target, err instanceof Error ? err.message : String(err));

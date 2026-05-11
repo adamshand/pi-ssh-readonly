@@ -9,7 +9,7 @@ A pi operating mode in which the agent's available SSH-backed tools can only rea
 _Avoid_: SSH mode, remote mode, read-only session
 
 **Global Auto-loaded Extension**:
-A pi extension installed in the user's global extension directory so its `--ssh-ro` flag is available from any working directory.
+A pi extension installed in the user's global extension directory so its `/sshro` command and `--ssh-ro` flag are available from any working directory.
 _Avoid_: manually loaded extension, project extension
 
 **Remote Working Directory**:
@@ -52,7 +52,7 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 
 - **SSH Read-only Mode** is provided by a **Global Auto-loaded Extension** in v1 at `~/.pi/agent/extensions/ssh-readonly/index.ts`.
 - A **Remote Working Directory** is not a confinement boundary; absolute remote paths remain accessible in v1.
-- `--ssh-ro` accepts only an SSH target in v1; the **Remote Working Directory** is resolved once at startup as the SSH user's login directory and remains fixed for the session.
+- `/sshro <target>` and `--ssh-ro <target>` accept only an SSH target; the **Remote Working Directory** is resolved when entering **SSH Read-only Mode** as the SSH user's login directory and remains fixed until logout.
 - **SSH Read-only Mode** exposes `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, `sshro_df`, `sshro_docker_ps`, `sshro_docker_inspect`, `sshro_docker_stats`, and `sshro_dig` as **SSH Read-only Tools**.
 - The `sshro_read`, `sshro_ls`, `sshro_find`, and `sshro_grep` tools mirror the practical built-in read-only tool schemas where possible.
 - The `sshro_read` tool keeps the familiar `path`, `offset`, and `limit` interface but performs line-range extraction on the remote server rather than downloading whole files for local slicing; positive offsets use remote `head`/`tail` instead of `sed`, and negative offsets read from the end of the file using remote `tail` for efficient log inspection.
@@ -64,12 +64,12 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - v1 does not keep non-file helper tools such as questionnaire active during **SSH Read-only Mode**.
 - The **User Bash Escape Hatch** remains available without extra warnings; **SSH Read-only Mode** restricts agent tools, not experienced sysadmin actions.
 - The agent may suggest human-run commands without special read-only prompting; the sysadmin remains responsible for deciding whether to run them.
-- **SSH Read-only Mode** requires **Non-interactive SSH Authentication** in v1.
+- **SSH Read-only Mode** requires **Non-interactive SSH Authentication** and a pre-existing OpenSSH known_hosts entry; SSH uses `BatchMode=yes` and `StrictHostKeyChecking=yes` so unknown hosts fail closed instead of prompting.
 - v1 requires the remote server to provide standard tools needed by the SSH-backed implementation, including `file` for read classification, and checks critical external commands such as `file`, `find`, `grep`, `head`, `sed`, `stat`, `tail`, and `ls` at startup.
 - If **SSH Read-only Mode** is requested but startup checks fail, v1 fails closed by clearing active tools, blocking all tool calls, and showing a fatal status/error instead of continuing in normal local mode.
-- On every session start or reload, v1 initializes **SSH Read-only Mode** from the `--ssh-ro` CLI flag; the CLI flag is the source of truth, not persisted session state.
-- When `--ssh-ro` is absent, the global extension is effectively invisible: it registers only the `--ssh-ro` flag and does not register SSH read-only tools, alter active tools, change prompts, or show UI.
-- When `--ssh-ro` is active, the extension registers `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, `sshro_df`, `sshro_docker_ps`, `sshro_docker_inspect`, `sshro_docker_stats`, and `sshro_dig`, sets the active tool list to exactly those tools, and blocks all other agent tool calls defensively; local built-in tools are not active.
+- **SSH Read-only Mode** can be entered at startup with `--ssh-ro <target>` or mid-session with `/sshro <target>`; `/sshro logout` leaves SSH Read-only Mode and restores the previous active tool set.
+- When **SSH Read-only Mode** is inactive, the global extension is mostly invisible: it registers only the `/sshro` command and `--ssh-ro` flag, and does not activate SSH read-only tools, alter active tools, change prompts, or show UI.
+- When **SSH Read-only Mode** is active, the extension registers `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, `sshro_df`, `sshro_docker_ps`, `sshro_docker_inspect`, `sshro_docker_stats`, and `sshro_dig`, sets the active tool list to exactly those tools, and blocks all other agent tool calls defensively; local built-in tools are not active.
 - v1 uses the **System SSH Client** rather than an SSH library; IPv6 target parsing is out of scope.
 - v1 allows any SSH target accepted by the **System SSH Client**, including root login targets such as `root@server`.
 - v1 does not support sudo escalation; use an SSH target with the desired read visibility.
@@ -95,12 +95,14 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - `sshro_docker_inspect` runs fixed `docker inspect [--type kind] target`, accepts only `container`, `image`, `network`, or `volume` as `kind`, and returns pretty JSON using Docker's native field names/shape with targeted redaction/omission. Environment variable values are never shown; if present, `Env` is visibly marked as `[redacted]` so the agent can ask the human operator for help if needed. There is no parameter to reveal environment values in curated output. Docker labels with sensitive-looking keys such as token/secret/password/key/credential are redacted. Image `GraphDriver.Data` is omitted because it exposes Docker storage internals such as `/var/lib/docker/overlay2/...`. Volume mountpoints and network topology/container mappings may be visible.
 - `sshro_docker_stats` reads one-shot `docker stats --no-stream --format '{{json .}}'` output, parses Docker JSON rows locally, and never starts Docker's streaming stats mode. `limit` must be at least 1, and row truncation appends an explicit note such as `[ssh-ro output truncated to 10 stat rows]`. If stats JSON output is unavailable or unparseable, it returns a clear tool error. CPU percentages can be noisy; the agent can call the tool multiple times a few seconds apart to compare.
 - `sshro_dig` performs fixed bounded DNS lookups from the remote host using `dig +time=3 +tries=1`, with optional record type, DNS server, and `+short` output. `dig` is checked at tool runtime rather than startup; if missing, the tool returns a clear error.
-- On successful SSH Read-only Mode startup, the extension emits one visible `ssh-ro-info` message containing the same concise mode note that is appended to the agent system prompt, reducing drift between human-visible and agent-visible guidance.
+- On successfully entering SSH Read-only Mode, the extension emits one visible `ssh-ro-info` message containing the same concise mode note that is appended to the agent system prompt, reducing drift between human-visible and agent-visible guidance.
+- If `/sshro <target>` is used while already active, the extension rejects the request and tells the user to run `/sshro logout` first; it does not switch targets implicitly.
+- The SSH Read-only Mode status bar shows only the target, not the remote cwd; the remote cwd remains visible in the mode note and prompt context.
 
 ## Example dialogue
 
-> **Dev:** "Can I start **SSH Read-only Mode** from any directory?"
-> **Domain expert:** "Yes — v1 uses a **Global Auto-loaded Extension**, so `pi --ssh-ro root@server` is available wherever pi is launched."
+> **Dev:** "Can I enter **SSH Read-only Mode** from any directory?"
+> **Domain expert:** "Yes — v1 uses a **Global Auto-loaded Extension**, so `/sshro root@server` and `pi --ssh-ro root@server` are available wherever pi is launched."
 >
 > **Dev:** "If I start at `/var/www`, can the agent inspect `/etc/nginx`?"
 > **Domain expert:** "Yes — `/var/www` is only the **Remote Working Directory**, not a chroot."

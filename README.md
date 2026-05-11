@@ -32,13 +32,25 @@ pi install git:git@github.com:adamshand/pi-ssh-readonly
 
 ## Usage
 
-You must start a new `pi` session the `--ssh-ro` argument, eg.
+Enter SSH Read-only Mode during an existing pi session:
+
+```text
+/sshro adam@server
+```
+
+Leave SSH Read-only Mode and restore the previous active tools:
+
+```text
+/sshro logout
+```
+
+You can also start pi directly in SSH Read-only Mode:
 
 ```bash
 pi --ssh-ro adam@server
 ```
 
-**Requires passwordless SSH. It will not prompt for a password.**
+**Requires passwordless SSH and an existing known_hosts entry. It will not prompt for a password or accept unknown hosts.**
 
 Paths are remote paths. Relative paths resolve from the remote login directory reported at startup. `~` is not expanded; use absolute paths like `/home/adam/...` or relative paths from the remote working directory.
 
@@ -49,6 +61,8 @@ You can run a shell command and automatically feed it back to the agent by using
 ```
 
 ## Configuration
+
+The extension uses OpenSSH with `BatchMode=yes` and `StrictHostKeyChecking=yes`, so authentication and host verification must already be configured before entering SSH Read-only Mode.
 
 Not required but configuring SSH to use connection sharing will speed things up.
 
