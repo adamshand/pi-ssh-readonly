@@ -60,6 +60,8 @@ Outside SSH Read-only Mode, you can run a local shell command and automatically 
 ! echo 'the agent can see this'
 ```
 
+Whenever this extension is loaded, agent-initiated `bash` tool calls are blocked from invoking common SSH client commands or SSH transport URLs, even outside SSH Read-only Mode. User-run `!` and `!!` commands are not blocked by this guard.
+
 While SSH Read-only Mode is active, `!` and `!!` run on the SSH target from the remote working directory. `!` feeds output back to the agent; `!!` shows output only to you. Remote command output ends with an `[ssh-ro: target:remoteCwd]` footer so the execution host and working directory are visible. The read-only guarantee applies to agent tools, not arbitrary commands you choose to run with `!`/`!!`.
 
 ## Configuration
