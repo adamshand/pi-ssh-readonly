@@ -75,7 +75,7 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - v1 does not support sudo escalation; use an SSH target with the desired read visibility.
 - v1 uses **Fixed Remote Command Templates** for SSH execution rather than installing helpers or sending scripts over stdin; templates are executed through remote `sh -c` so non-POSIX login shells such as fish do not parse the templates.
 - **Remote Prompt Context** replaces the normal local current-working-directory line with the fixed **Remote Working Directory** and states that `sshro_*` tools operate on the SSH target.
-- During **SSH Read-only Mode**, user `!` and `!!` commands execute on the SSH target from the fixed **Remote Working Directory**; `!!` still excludes output from model context, and displayed remote command output begins with an `[ssh-ro target]$ ...` prompt line.
+- During **SSH Read-only Mode**, user `!` and `!!` commands execute on the SSH target from the fixed **Remote Working Directory**; `!!` still excludes output from model context, and displayed remote command output ends with an `[ssh-ro: target:remoteCwd]` footer.
 - v1 applies best-effort credential guardrails: direct content reads/searches are blocked for common credential directories/files, shell history files, password-manager paths, and chezmoi paths. Recursive `sshro_grep` prunes common credential/history/password-manager/dotfile-manager paths by default. This is not a chroot or adversarial DLP boundary.
 - v1 does not expand `~` in tool paths; use absolute home paths such as `/home/name` or paths relative to the **Remote Working Directory**.
 - v1 rejects tool paths and patterns containing newlines or control characters while allowing ordinary spaces and punctuation through shell quoting.

@@ -174,11 +174,11 @@ function sshBashOperations(target: string, remoteCwd: string): BashOperations {
 	return {
 		exec(command, _cwd, { onData, signal, timeout }) {
 			return new Promise((resolve, reject) => {
-				const displayCommand = command.replace(/\s*\r?\n\s*/g, " ; ");
-				onData(Buffer.from(`[ssh-ro ${target}]$ ${displayCommand}\n`));
 				const child = spawnSsh(target, `cd ${shellQuote(remoteCwd)} && ${command}`);
 				let timedOut = false;
 				let timer: ReturnType<typeof setTimeout> | undefined;
+				let sawOutput = false;
+				let endedWithNewline = true;
 				if (timeout !== undefined && timeout > 0) {
 					timer = setTimeout(() => {
 						timedOut = true;
@@ -189,16 +189,25 @@ function sshBashOperations(target: string, remoteCwd: string): BashOperations {
 					if (timer) clearTimeout(timer);
 					signal?.removeEventListener("abort", onAbort);
 				};
+				const emit = (d: Buffer) => {
+					sawOutput = true;
+					endedWithNewline = d.length === 0 || d[d.length - 1] === 10;
+					onData(d);
+				};
 				const onAbort = () => child.kill("SIGTERM");
 				signal?.addEventListener("abort", onAbort, { once: true });
-				child.stdout.on("data", (d) => onData(Buffer.from(d)));
-				child.stderr.on("data", (d) => onData(Buffer.from(d)));
+				child.stdout.on("data", (d) => emit(Buffer.from(d)));
+				child.stderr.on("data", (d) => emit(Buffer.from(d)));
 				child.on("error", (err) => {
 					cleanup();
 					reject(err);
 				});
 				child.on("close", (code) => {
 					cleanup();
+
+					const spacer = sawOutput ? (endedWithNewline ? "\n" : "\n\n") : "";
+					onData(Buffer.from(`${spacer}[ssh-ro: ${target}:${remoteCwd}]\n`));
+
 					if (signal?.aborted) reject(new Error("aborted"));
 					else if (timedOut) reject(new Error(`timeout:${timeout}`));
 					else resolve({ exitCode: code });
@@ -385,7 +394,7 @@ function sshRoModeNote(target: string, remoteCwd: string): string {
 - Docker tools are optional fixed read-only inspections. sshro_docker_ps returns compact Docker table output by default; sshro_docker_inspect returns curated JSON and visibly redacts environment variables because Docker metadata can contain secrets.
 - sshro_read supports negative offset values to read from the end of large files using tail.
 - sshro_dig performs fixed, bounded DNS lookups with dig when available on the remote host.
-- User ! and !! commands run on the SSH target while SSH Read-only Mode is active; !! still excludes output from model context. Remote command output begins with an [ssh-ro target]$ prompt line.`;
+- User ! and !! commands run on the SSH target while SSH Read-only Mode is active; !! still excludes output from model context. Remote command output ends with an [ssh-ro: target:remoteCwd] footer.`;
 }
 
 function requireHealthy(): { target: string; remoteCwd: string } {

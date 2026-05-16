@@ -60,7 +60,7 @@ Outside SSH Read-only Mode, you can run a local shell command and automatically 
 ! echo 'the agent can see this'
 ```
 
-While SSH Read-only Mode is active, `!` and `!!` run on the SSH target from the remote working directory. `!` feeds output back to the agent; `!!` shows output only to you. Remote command output starts with an `[ssh-ro target]$ ...` prompt line so the execution host is visible. The read-only guarantee applies to agent tools, not arbitrary commands you choose to run with `!`/`!!`.
+While SSH Read-only Mode is active, `!` and `!!` run on the SSH target from the remote working directory. `!` feeds output back to the agent; `!!` shows output only to you. Remote command output ends with an `[ssh-ro: target:remoteCwd]` footer so the execution host and working directory are visible. The read-only guarantee applies to agent tools, not arbitrary commands you choose to run with `!`/`!!`.
 
 ## Configuration
 
