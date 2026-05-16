@@ -25,7 +25,7 @@ The runtime enforcement policy that allows only the registered `sshro_*` diagnos
 _Avoid_: registered-tool ban, extension blacklist
 
 **User Bash Escape Hatch**:
-The existing pi `!` and `!!` mechanism for human-supervised shell commands, left unchanged during **SSH Read-only Mode**.
+The existing pi `!` and `!!` mechanism for human-supervised shell commands. During **SSH Read-only Mode**, the extension routes these commands to the SSH target instead of the local host; `!!` keeps pi's existing no-context behavior.
 _Avoid_: agent bash, remote bash tool
 
 **Non-interactive SSH Authentication**:
@@ -75,6 +75,7 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - v1 does not support sudo escalation; use an SSH target with the desired read visibility.
 - v1 uses **Fixed Remote Command Templates** for SSH execution rather than installing helpers or sending scripts over stdin; templates are executed through remote `sh -c` so non-POSIX login shells such as fish do not parse the templates.
 - **Remote Prompt Context** replaces the normal local current-working-directory line with the fixed **Remote Working Directory** and states that `sshro_*` tools operate on the SSH target.
+- During **SSH Read-only Mode**, user `!` and `!!` commands execute on the SSH target from the fixed **Remote Working Directory**; `!!` still excludes output from model context, and displayed remote command output begins with an `[ssh-ro target]$ ...` prompt line.
 - v1 applies best-effort credential guardrails: direct content reads/searches are blocked for common credential directories/files, shell history files, password-manager paths, and chezmoi paths. Recursive `sshro_grep` prunes common credential/history/password-manager/dotfile-manager paths by default. This is not a chroot or adversarial DLP boundary.
 - v1 does not expand `~` in tool paths; use absolute home paths such as `/home/name` or paths relative to the **Remote Working Directory**.
 - v1 rejects tool paths and patterns containing newlines or control characters while allowing ordinary spaces and punctuation through shell quoting.
@@ -113,5 +114,5 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - "root" or path suffixes in `user@host:/path` could mean either a confinement boundary or starting location; resolved: v1 does not support `target:/path` and uses the SSH login directory as the **Remote Working Directory**.
 - Tool names could either be SSH-specific or reuse pi built-in names; resolved: v1 uses explicit **SSH Read-only Tools** named `sshro_read`, `sshro_ls`, `sshro_find`, and `sshro_grep` for clarity and auditability.
 - Unexpected registered tools could be fatal or ignored; resolved: the **SSH Read-only Tool Gate** is strict for active tools and SSH-backed tool ownership, but only warns about unrelated inactive tools.
-- User `!` and `!!` commands could be blocked, warned, or left unchanged; resolved: preserve the **User Bash Escape Hatch** unchanged for experienced sysadmins.
+- User `!` and `!!` commands could be blocked, warned, left local, or routed to the active SSH target; resolved: during **SSH Read-only Mode**, route both to the SSH target because local execution while visually investigating a remote host is more confusing. `!!` still excludes output from model context.
 - The agent could be restricted to suggesting only read-only human-run commands; resolved: do not add special restrictions because the sysadmin chooses what risk to accept.

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BashOperations, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createLsTool } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import Type from "typebox";
@@ -129,17 +129,21 @@ function truncateText(text: string, maxLines = DEFAULT_LINE_LIMIT, maxBytes = DE
 	return out;
 }
 
+function spawnSsh(target: string, command: string) {
+	// Force POSIX sh for remote command templates. OpenSSH normally passes the
+	// command through the user's login shell; many legacy/admin accounts use
+	// fish/csh/etc., which do not understand POSIX for/if syntax.
+	const remoteCommand = `sh -c ${shellQuote(command)}`;
+	return spawn(
+		"ssh",
+		["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", target, remoteCommand],
+		{ stdio: ["ignore", "pipe", "pipe"] },
+	);
+}
+
 function sshExec(target: string, command: string, signal?: AbortSignal, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<{ stdout: string; stderr: string; code: number | null }> {
 	return new Promise((resolve, reject) => {
-		// Force POSIX sh for remote command templates. OpenSSH normally passes the
-		// command through the user's login shell; many legacy/admin accounts use
-		// fish/csh/etc., which do not understand POSIX for/if syntax.
-		const remoteCommand = `sh -c ${shellQuote(command)}`;
-		const child = spawn(
-			"ssh",
-			["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", target, remoteCommand],
-			{ stdio: ["ignore", "pipe", "pipe"] },
-		);
+		const child = spawnSsh(target, command);
 		const stdout: Buffer[] = [];
 		const stderr: Buffer[] = [];
 		let timedOut = false;
@@ -164,6 +168,44 @@ function sshExec(target: string, command: string, signal?: AbortSignal, timeoutM
 			else resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"), code });
 		});
 	});
+}
+
+function sshBashOperations(target: string, remoteCwd: string): BashOperations {
+	return {
+		exec(command, _cwd, { onData, signal, timeout }) {
+			return new Promise((resolve, reject) => {
+				const displayCommand = command.replace(/\s*\r?\n\s*/g, " ; ");
+				onData(Buffer.from(`[ssh-ro ${target}]$ ${displayCommand}\n`));
+				const child = spawnSsh(target, `cd ${shellQuote(remoteCwd)} && ${command}`);
+				let timedOut = false;
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				if (timeout !== undefined && timeout > 0) {
+					timer = setTimeout(() => {
+						timedOut = true;
+						child.kill("SIGTERM");
+					}, timeout * 1000);
+				}
+				const cleanup = () => {
+					if (timer) clearTimeout(timer);
+					signal?.removeEventListener("abort", onAbort);
+				};
+				const onAbort = () => child.kill("SIGTERM");
+				signal?.addEventListener("abort", onAbort, { once: true });
+				child.stdout.on("data", (d) => onData(Buffer.from(d)));
+				child.stderr.on("data", (d) => onData(Buffer.from(d)));
+				child.on("error", (err) => {
+					cleanup();
+					reject(err);
+				});
+				child.on("close", (code) => {
+					cleanup();
+					if (signal?.aborted) reject(new Error("aborted"));
+					else if (timedOut) reject(new Error(`timeout:${timeout}`));
+					else resolve({ exitCode: code });
+				});
+			});
+		},
+	};
 }
 
 async function sshChecked(target: string, command: string, signal?: AbortSignal, timeoutMs?: number): Promise<string> {
@@ -342,7 +384,8 @@ function sshRoModeNote(target: string, remoteCwd: string): string {
 	return `SSH Read-only Mode active: ${target}\nRemote cwd: ${remoteCwd}\n\nAvailable tools:\n${TOOL_NAMES.join(", ")}\n\nPath notes:\n- Paths are remote paths; relative paths resolve from the remote cwd.\n- ~ is not expanded; use absolute paths like /home/name/... or relative paths from the remote cwd.\n- [blocked] means credential/history/password-manager content is blocked; ask the user to inspect manually if needed.\n- sshro_find shows matching blocked entries but does not descend into blocked directories, so parent searches may not enumerate blocked children.\n- sshro_df defaults to local filesystems only to reduce risk from slow network mounts.
 - Docker tools are optional fixed read-only inspections. sshro_docker_ps returns compact Docker table output by default; sshro_docker_inspect returns curated JSON and visibly redacts environment variables because Docker metadata can contain secrets.
 - sshro_read supports negative offset values to read from the end of large files using tail.
-- sshro_dig performs fixed, bounded DNS lookups with dig when available on the remote host.`;
+- sshro_dig performs fixed, bounded DNS lookups with dig when available on the remote host.
+- User ! and !! commands run on the SSH target while SSH Read-only Mode is active; !! still excludes output from model context. Remote command output begins with an [ssh-ro target]$ prompt line.`;
 }
 
 function requireHealthy(): { target: string; remoteCwd: string } {
@@ -897,7 +940,7 @@ async function activateSshRo(pi: ExtensionAPI, ctx: ExtensionContext, target: st
 	previousActiveTools = pi.getActiveTools();
 	state = { active: true, target, remoteCwd, fatal: false };
 	pi.setActiveTools([...TOOL_NAMES]);
-	ctx.ui.setStatus("ssh-ro", ctx.ui.theme.fg("accent", `SSH RO ${target}`));
+	ctx.ui.setStatus("ssh-ro", ctx.ui.theme.fg("accent", `SSH RO ${target} (! remote)`));
 	ctx.ui.notify(`SSH Read-only Mode: ${target} (remote cwd ${remoteCwd})`, "info");
 	pi.sendMessage({
 		customType: "ssh-ro-info",
@@ -958,6 +1001,14 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 			const target = typeof raw === "string" ? raw.trim() : "<unknown>";
 			failClosed(pi, ctx, target, err instanceof Error ? err.message : String(err));
 		}
+	});
+
+	pi.on("user_bash", () => {
+		if (!state.active) return;
+		if (state.fatal) {
+			return { result: { output: `SSH Read-only Mode startup failed: ${state.reason}`, exitCode: 1, cancelled: false, truncated: false } };
+		}
+		return { operations: sshBashOperations(state.target, state.remoteCwd) };
 	});
 
 	pi.on("tool_call", (event) => {

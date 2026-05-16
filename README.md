@@ -54,11 +54,13 @@ pi --ssh-ro adam@server
 
 Paths are remote paths. Relative paths resolve from the remote login directory reported at startup. `~` is not expanded; use absolute paths like `/home/adam/...` or relative paths from the remote working directory.
 
-You can run a shell command and automatically feed it back to the agent by using the `!` command, eg.
+Outside SSH Read-only Mode, you can run a local shell command and automatically feed it back to the agent by using the `!` command, eg.
 
 ```bash
 ! echo 'the agent can see this'
 ```
+
+While SSH Read-only Mode is active, `!` and `!!` run on the SSH target from the remote working directory. `!` feeds output back to the agent; `!!` shows output only to you. Remote command output starts with an `[ssh-ro target]$ ...` prompt line so the execution host is visible. The read-only guarantee applies to agent tools, not arbitrary commands you choose to run with `!`/`!!`.
 
 ## Configuration
 
