@@ -56,6 +56,12 @@ pi --ssh-ro adam@server
 
 The agent can request SSH Read-only Mode by calling `sshro_connect` with a target. If the target is listed in `SSHRO_HOST_WHITELIST`, the extension connects immediately. Otherwise, pi prompts the human to approve or deny the connection. In non-interactive modes, non-whitelisted agent connection requests fail closed because approval is not possible.
 
+Connection approval is only for agent-initiated `sshro_connect` calls:
+
+- Human-initiated `/sshro <target>` and `pi --ssh-ro <target>` do not consult the whitelist.
+- Whitelist matches use the exact target string passed to `sshro_connect`; `binney` and `adam@binney` are different entries.
+- After connection, `sshro_connect` is no longer active; the agent gets the read-only `sshro_*` tools plus `sshro_disconnect`.
+
 **Requires passwordless SSH and an existing known_hosts entry. It will not prompt for a password or accept unknown hosts.**
 
 Paths are remote paths. Relative paths resolve from the remote login directory reported at startup. `~` is not expanded; use absolute paths like `/home/adam/...` or relative paths from the remote working directory.
@@ -74,11 +80,15 @@ While SSH Read-only Mode is active, `!` and `!!` run on the SSH target from the 
 
 The extension uses OpenSSH with `BatchMode=yes` and `StrictHostKeyChecking=yes`, so authentication and host verification must already be configured before entering SSH Read-only Mode.
 
-`SSHRO_HOST_WHITELIST` is an auto-connect approval list for agent-initiated `sshro_connect` calls. It is not an access-control denylist: non-whitelisted targets can still be connected to after explicit human approval. Values are comma-separated and matched exactly against the target string the agent passes; OpenSSH still resolves aliases, ProxyJump, identities, and other SSH config normally when the connection is made. The configured target strings are included in the `sshro_connect` tool hint so the agent knows which targets can be used without prompting.
+`SSHRO_HOST_WHITELIST` is an auto-connect approval list for agent-initiated `sshro_connect` calls. Set it in the environment before starting pi:
 
 ```bash
-SSHRO_HOST_WHITELIST="web1,adam@legacy,prod-readonly"
+SSHRO_HOST_WHITELIST="web1,adam@legacy,prod-readonly" pi
 ```
+
+It is not an access-control denylist: non-whitelisted targets can still be connected to after explicit human approval. Values are comma-separated, trimmed, and matched exactly against the target string the agent passes; OpenSSH still resolves aliases, ProxyJump, identities, and other SSH config normally when the connection is made.
+
+The configured target strings are included in the `sshro_connect` tool hint so the agent knows which targets can be used without prompting. The hint explicitly says that automatic approval requires using the target exactly as listed, so a whitelist entry like `binney` does not imply `adam@binney`. If more than 20 targets are configured, the hint shows the first 20 and reports how many more are present.
 
 Not required but configuring SSH to use connection sharing will speed things up.
 

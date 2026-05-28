@@ -67,11 +67,11 @@ function isWhitelistedHost(target: string): boolean {
 
 function whitelistedHostsPromptHint(): string {
 	const hosts = [...whitelistedHosts()];
-	if (hosts.length === 0) return `No targets are currently listed in ${SSHRO_HOST_WHITELIST_ENV}; non-whitelisted targets require human approval.`;
 	const maxShown = 20;
 	const shown = hosts.slice(0, maxShown).join(", ");
 	const suffix = hosts.length > maxShown ? `, ... (${hosts.length - maxShown} more)` : "";
-	return `Auto-connect targets from ${SSHRO_HOST_WHITELIST_ENV}: ${shown}${suffix}. Other targets require human approval.`;
+	const list = hosts.length === 0 ? "no targets configured" : `${shown}${suffix}`;
+	return `SSH connection requests require approval unless the target is on the whitelist. For automatic approval, use the target exactly as listed.\n\nWhitelist: ${list}.`;
 }
 
 function validatePathLike(value: string, label: string): void {
@@ -479,8 +479,8 @@ function registerSshRoConnectTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: SSHRO_CONNECT_TOOL,
 		label: SSHRO_CONNECT_TOOL,
-		description: `Ask to enter SSH Read-only Mode for an SSH target. ${whitelistHint}`,
-		promptSnippet: `sshro_connect: Request SSH Read-only Mode for an SSH target. ${whitelistHint}`,
+		description: `Connect to a server via SSH Read-only Mode. ${whitelistHint}`,
+		promptSnippet: `sshro_connect: Connect to a server via SSH Read-only Mode. ${whitelistHint}`,
 		parameters: Type.Object({
 			target: Type.String({ description: "SSH target to connect to, e.g. user@host or an OpenSSH Host alias" }),
 		}),
