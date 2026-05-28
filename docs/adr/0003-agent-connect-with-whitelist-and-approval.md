@@ -6,6 +6,6 @@ Agent-initiated connection requests preserve human control. The extension valida
 
 `SSHRO_HOST_WHITELIST` is an auto-connect approval list, not an access-control denylist. Non-whitelisted targets can still be used after explicit human approval, and human-initiated `/sshro <target>` keeps working as before.
 
-Whitelist matching intentionally compares the literal target string passed to `sshro_connect`. The extension does not canonicalize hostnames or parse SSH configuration. OpenSSH still resolves aliases, ProxyJump, identities, ports, and other configuration normally when the connection is made.
+Whitelist matching intentionally compares the literal target string passed to `sshro_connect`. The extension does not canonicalize hostnames or parse SSH configuration. OpenSSH still resolves aliases, ProxyJump, identities, ports, and other configuration normally when the connection is made. The `sshro_connect` tool hint includes the configured whitelist target strings, truncated after 20 entries, so the agent can prefer auto-approved targets instead of guessing and triggering unnecessary approval prompts.
 
 Once SSH Read-only Mode is active, `sshro_connect` is removed from the active tool set. The active agent tool surface becomes the curated read-only diagnostic tools plus `sshro_disconnect`, which lets the agent leave SSH Read-only Mode without human approval. The existing tool gate continues to block all other tool calls.

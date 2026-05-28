@@ -74,7 +74,7 @@ While SSH Read-only Mode is active, `!` and `!!` run on the SSH target from the 
 
 The extension uses OpenSSH with `BatchMode=yes` and `StrictHostKeyChecking=yes`, so authentication and host verification must already be configured before entering SSH Read-only Mode.
 
-`SSHRO_HOST_WHITELIST` is an auto-connect approval list for agent-initiated `sshro_connect` calls. It is not an access-control denylist: non-whitelisted targets can still be connected to after explicit human approval. Values are comma-separated and matched exactly against the target string the agent passes; OpenSSH still resolves aliases, ProxyJump, identities, and other SSH config normally when the connection is made.
+`SSHRO_HOST_WHITELIST` is an auto-connect approval list for agent-initiated `sshro_connect` calls. It is not an access-control denylist: non-whitelisted targets can still be connected to after explicit human approval. Values are comma-separated and matched exactly against the target string the agent passes; OpenSSH still resolves aliases, ProxyJump, identities, and other SSH config normally when the connection is made. The configured target strings are included in the `sshro_connect` tool hint so the agent knows which targets can be used without prompting.
 
 ```bash
 SSHRO_HOST_WHITELIST="web1,adam@legacy,prod-readonly"

@@ -65,6 +65,15 @@ function isWhitelistedHost(target: string): boolean {
 	return whitelistedHosts().has(target);
 }
 
+function whitelistedHostsPromptHint(): string {
+	const hosts = [...whitelistedHosts()];
+	if (hosts.length === 0) return `No targets are currently listed in ${SSHRO_HOST_WHITELIST_ENV}; non-whitelisted targets require human approval.`;
+	const maxShown = 20;
+	const shown = hosts.slice(0, maxShown).join(", ");
+	const suffix = hosts.length > maxShown ? `, ... (${hosts.length - maxShown} more)` : "";
+	return `Auto-connect targets from ${SSHRO_HOST_WHITELIST_ENV}: ${shown}${suffix}. Other targets require human approval.`;
+}
+
 function validatePathLike(value: string, label: string): void {
 	if (hasControlChars(value)) throw new Error(`${label} contains a newline or control character`);
 	if (value === "~" || value.startsWith("~/")) throw new Error(`${label}: ~ expansion is not supported in SSH Read-only Mode v1`);
@@ -466,11 +475,12 @@ async function startupCheck(target: string): Promise<string> {
 function registerSshRoConnectTool(pi: ExtensionAPI): void {
 	if (connectToolRegistered) return;
 	connectToolRegistered = true;
+	const whitelistHint = whitelistedHostsPromptHint();
 	pi.registerTool({
 		name: SSHRO_CONNECT_TOOL,
 		label: SSHRO_CONNECT_TOOL,
-		description: "Ask to enter SSH Read-only Mode for an SSH target. Targets in SSHRO_HOST_WHITELIST auto-connect; other targets require human approval.",
-		promptSnippet: "sshro_connect: Request SSH Read-only Mode for an SSH target. Targets in SSHRO_HOST_WHITELIST auto-connect; other targets require human approval.",
+		description: `Ask to enter SSH Read-only Mode for an SSH target. ${whitelistHint}`,
+		promptSnippet: `sshro_connect: Request SSH Read-only Mode for an SSH target. ${whitelistHint}`,
 		parameters: Type.Object({
 			target: Type.String({ description: "SSH target to connect to, e.g. user@host or an OpenSSH Host alias" }),
 		}),
