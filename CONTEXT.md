@@ -9,7 +9,7 @@ A pi operating mode in which the agent's available SSH-backed tools can only rea
 _Avoid_: SSH mode, remote mode, read-only session
 
 **Global Auto-loaded Extension**:
-A pi extension installed in the user's global extension directory so its `/sshro` command and `--ssh-ro` flag are available from any working directory.
+A pi extension installed in the user's global extension directory so its `/sshro` command, `--ssh-ro` flag, and `sshro_connect` tool are available from any working directory.
 _Avoid_: manually loaded extension, project extension
 
 **Remote Working Directory**:
@@ -21,8 +21,16 @@ An explicit `sshro_*` tool whose behavior is implemented against the remote serv
 _Avoid_: overloaded built-in tool names, local tool ambiguity, whole-file local slicing
 
 **SSH Read-only Tool Gate**:
-The runtime enforcement policy that allows only the registered `sshro_*` diagnostic tools to be active or callable during **SSH Read-only Mode**.
+The runtime enforcement policy that allows only the registered read-only diagnostic tools to be active or callable during **SSH Read-only Mode**.
 _Avoid_: registered-tool ban, extension blacklist
+
+**Agent Connect Tool**:
+The `sshro_connect` tool available before **SSH Read-only Mode** is active, allowing the agent to request a specific SSH target while preserving whitelist auto-approval and human approval for non-whitelisted targets.
+_Avoid_: remote shell, arbitrary SSH bash
+
+**SSHRO Host Whitelist**:
+The `SSHRO_HOST_WHITELIST` environment variable whose comma-separated exact target strings allow agent-initiated `sshro_connect` requests to auto-connect without prompting the human.
+_Avoid_: denylist, canonical host policy, SSH config parser
 
 **User Bash Escape Hatch**:
 The existing pi `!` and `!!` mechanism for human-supervised shell commands. During **SSH Read-only Mode**, the extension routes these commands to the SSH target instead of the local host; `!!` keeps pi's existing no-context behavior.
@@ -60,16 +68,20 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 - `sshro_read` is text-only in v1, uses remote `file` output to classify non-text files, shows that classification in the tool result, and refuses binary content rather than preserving built-in image support.
 - `sshro_grep` uses remote `grep -E` extended regex semantics by default, searches directories recursively, prunes `.git`, `node_modules`, and common credential paths, skips binary files by default, supports simple file-selection globs such as `*.conf` or `*.log` to reduce tool calls, and uses fixed-string `grep -F` matching when `literal: true`.
 - Remote `grep` and `find` return **Visible Search Errors** as summaries alongside any successful results so permission errors do not consume the match/result budget; callers can request detailed errors with `showErrors: true` and bound them with `errorLimit`.
-- The **SSH Read-only Tool Gate** requires active tools to be exactly the registered `sshro_*` tools, warns about unrelated inactive tools, and blocks all other tool calls.
+- The **SSH Read-only Tool Gate** requires active tools to be exactly the registered read-only diagnostic tools while **SSH Read-only Mode** is active, warns about unrelated inactive tools, and blocks all other tool calls.
 - v1 does not keep non-file helper tools such as questionnaire active during **SSH Read-only Mode**.
 - The **User Bash Escape Hatch** remains available without extra warnings; **SSH Read-only Mode** restricts agent tools, not experienced sysadmin actions.
 - The agent may suggest human-run commands without special read-only prompting; the sysadmin remains responsible for deciding whether to run them.
 - **SSH Read-only Mode** requires **Non-interactive SSH Authentication** and a pre-existing OpenSSH known_hosts entry; SSH uses `BatchMode=yes` and `StrictHostKeyChecking=yes` so unknown hosts fail closed instead of prompting.
 - v1 requires the remote server to provide standard tools needed by the SSH-backed implementation, including `file` for read classification, and checks critical external commands such as `file`, `find`, `grep`, `head`, `sed`, `stat`, `tail`, and `ls` at startup.
 - If **SSH Read-only Mode** is requested but startup checks fail, v1 fails closed by clearing active tools, blocking all tool calls, and showing a fatal status/error instead of continuing in normal local mode.
-- **SSH Read-only Mode** can be entered at startup with `--ssh-ro <target>` or mid-session with `/sshro <target>`; `/sshro logout` leaves SSH Read-only Mode and restores the previous active tool set.
-- When **SSH Read-only Mode** is inactive, the global extension is mostly invisible: it registers only the `/sshro` command and `--ssh-ro` flag, does not activate SSH read-only tools, alter active tools, change prompts, or show UI, and still blocks agent-initiated `bash` tool calls from invoking common SSH client commands or SSH transport URLs.
-- When **SSH Read-only Mode** is active, the extension registers `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, `sshro_df`, `sshro_docker_ps`, `sshro_docker_inspect`, `sshro_docker_stats`, and `sshro_dig`, sets the active tool list to exactly those tools, and blocks all other agent tool calls defensively; local built-in tools are not active.
+- **SSH Read-only Mode** can be entered at startup with `--ssh-ro <target>`, mid-session by the human with `/sshro <target>`, or by the agent with the **Agent Connect Tool**; `/sshro logout` leaves SSH Read-only Mode and restores the previous active tool set.
+- The **Agent Connect Tool** validates the requested target, checks the **SSHRO Host Whitelist**, and then either auto-connects whitelisted targets or asks the human to approve non-whitelisted targets before any SSH connection attempt is made.
+- If the **Agent Connect Tool** requests a non-whitelisted target when no UI is available, the request fails closed because human approval is impossible.
+- The **SSHRO Host Whitelist** is an auto-connect approval list, not an access-control denylist: targets absent from `SSHRO_HOST_WHITELIST` can still be connected to after explicit human approval.
+- The **SSHRO Host Whitelist** uses exact string matching against the target argument passed to `sshro_connect`; the extension does not canonicalize hosts or parse SSH config, and the **System SSH Client** still resolves aliases, ProxyJump, identities, and other SSH configuration normally when connecting.
+- When **SSH Read-only Mode** is inactive, the global extension is mostly invisible: it registers only the `/sshro` command, `--ssh-ro` flag, and `sshro_connect` tool, does not activate SSH read-only diagnostic tools, alter active tools, change prompts, or show UI unless the agent calls `sshro_connect` for a non-whitelisted target, and still blocks agent-initiated `bash` tool calls from invoking common SSH client commands or SSH transport URLs so the agent uses the **Agent Connect Tool** instead.
+- When **SSH Read-only Mode** is active, the extension registers `sshro_read`, `sshro_ls`, `sshro_find`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, `sshro_df`, `sshro_docker_ps`, `sshro_docker_inspect`, `sshro_docker_stats`, and `sshro_dig`, sets the active tool list to exactly those tools, and blocks all other agent tool calls defensively; local built-in tools and `sshro_connect` are not active.
 - v1 uses the **System SSH Client** rather than an SSH library; IPv6 target parsing is out of scope.
 - v1 allows any SSH target accepted by the **System SSH Client**, including root login targets such as `root@server`.
 - v1 does not support sudo escalation; use an SSH target with the desired read visibility.
@@ -103,7 +115,7 @@ _Avoid_: arbitrary remote shell, stdin helper script in v1
 ## Example dialogue
 
 > **Dev:** "Can I enter **SSH Read-only Mode** from any directory?"
-> **Domain expert:** "Yes — v1 uses a **Global Auto-loaded Extension**, so `/sshro root@server` and `pi --ssh-ro root@server` are available wherever pi is launched."
+> **Domain expert:** "Yes — v1 uses a **Global Auto-loaded Extension**, so `/sshro root@server`, `pi --ssh-ro root@server`, and agent-requested `sshro_connect({ target: "root@server" })` are available wherever pi is launched."
 >
 > **Dev:** "If I start at `/var/www`, can the agent inspect `/etc/nginx`?"
 > **Domain expert:** "Yes — `/var/www` is only the **Remote Working Directory**, not a chroot."

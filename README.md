@@ -4,7 +4,7 @@
 
 I sometimes work with legacy servers where configuration has been managed by hand for years. Agent assistance on these servers is extremely valuable.  However the risk of an agent making an undetected change to a production server isn't acceptable.
 
-This extension disables all built in tools and adds a new set of read only tools.  The current set of tools is:
+When SSH Read-only Mode is active, this extension disables all built in tools and adds a new set of read only tools.  The current read-only tool set is:
 
 - sshro_read
 - sshro_ls
@@ -19,6 +19,8 @@ This extension disables all built in tools and adds a new set of read only tools
 - sshro_docker_inspect
 - sshro_docker_stats
 - sshro_dig
+
+Outside SSH Read-only Mode, the agent can also call `sshro_connect` to request a connection. Targets in `SSHRO_HOST_WHITELIST` auto-connect; other targets require explicit human approval.
 
 It redacts and filters obvious password/secret risks, but doesn't try and catch everything (eg. passwords in `ps` output).  If this is critical in your environment you may want to make changes.
 
@@ -50,6 +52,8 @@ You can also start pi directly in SSH Read-only Mode:
 pi --ssh-ro adam@server
 ```
 
+The agent can request SSH Read-only Mode by calling `sshro_connect` with a target. If the target is listed in `SSHRO_HOST_WHITELIST`, the extension connects immediately. Otherwise, pi prompts the human to approve or deny the connection. In non-interactive modes, non-whitelisted agent connection requests fail closed because approval is not possible.
+
 **Requires passwordless SSH and an existing known_hosts entry. It will not prompt for a password or accept unknown hosts.**
 
 Paths are remote paths. Relative paths resolve from the remote login directory reported at startup. `~` is not expanded; use absolute paths like `/home/adam/...` or relative paths from the remote working directory.
@@ -60,13 +64,19 @@ Outside SSH Read-only Mode, you can run a local shell command and automatically 
 ! echo 'the agent can see this'
 ```
 
-Whenever this extension is loaded, agent-initiated `bash` tool calls are blocked from invoking common SSH client commands or SSH transport URLs, even outside SSH Read-only Mode. User-run `!` and `!!` commands are not blocked by this guard.
+Whenever this extension is loaded, agent-initiated `bash` tool calls are blocked from invoking common SSH client commands or SSH transport URLs, even outside SSH Read-only Mode. The agent should use `sshro_connect` to request a connection instead. User-run `!` and `!!` commands are not blocked by this guard.
 
 While SSH Read-only Mode is active, `!` and `!!` run on the SSH target from the remote working directory. `!` feeds output back to the agent; `!!` shows output only to you. Remote command output ends with an `[ssh-ro: target:remoteCwd]` footer so the execution host and working directory are visible. The read-only guarantee applies to agent tools, not arbitrary commands you choose to run with `!`/`!!`.
 
 ## Configuration
 
 The extension uses OpenSSH with `BatchMode=yes` and `StrictHostKeyChecking=yes`, so authentication and host verification must already be configured before entering SSH Read-only Mode.
+
+`SSHRO_HOST_WHITELIST` is an auto-connect approval list for agent-initiated `sshro_connect` calls. It is not an access-control denylist: non-whitelisted targets can still be connected to after explicit human approval. Values are comma-separated and matched exactly against the target string the agent passes; OpenSSH still resolves aliases, ProxyJump, identities, and other SSH config normally when the connection is made.
+
+```bash
+SSHRO_HOST_WHITELIST="web1,adam@legacy,prod-readonly"
+```
 
 Not required but configuring SSH to use connection sharing will speed things up.
 

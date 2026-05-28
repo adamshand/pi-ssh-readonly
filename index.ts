@@ -9,6 +9,8 @@ type SshRoState =
 	| { active: true; target: string; remoteCwd: string; fatal: false }
 	| { active: true; target: string; remoteCwd?: string; fatal: true; reason: string };
 
+const SSHRO_CONNECT_TOOL = "sshro_connect";
+const SSHRO_HOST_WHITELIST_ENV = "SSHRO_HOST_WHITELIST";
 const TOOL_NAMES = ["sshro_read", "sshro_ls", "sshro_find", "sshro_grep", "sshro_journalctl", "sshro_systemctl", "sshro_ps", "sshro_ss", "sshro_df", "sshro_docker_ps", "sshro_docker_inspect", "sshro_docker_stats", "sshro_dig"] as const;
 const REQUIRED_REMOTE_COMMANDS = ["file", "find", "grep", "head", "sed", "stat", "tail", "ls"];
 const DEFAULT_LINE_LIMIT = 2000;
@@ -35,6 +37,8 @@ const SSH_ENV_RE = /\b(?:GIT_SSH|GIT_SSH_COMMAND|RSYNC_RSH)\s*=/i;
 
 let state: SshRoState = { active: false };
 let toolsRegistered = false;
+let connectToolRegistered = false;
+let connectInProgressTarget: string | undefined;
 let previousActiveTools: string[] | undefined;
 
 function shellQuote(value: string): string {
@@ -51,13 +55,21 @@ function validateTarget(target: string): void {
 	if (target.includes(":")) throw new Error("--ssh-ro v1 accepts only an SSH target, not target:/path or IPv6 syntax");
 }
 
+function whitelistedHosts(): Set<string> {
+	return new Set((process.env[SSHRO_HOST_WHITELIST_ENV] ?? "").split(",").map((host) => host.trim()).filter(Boolean));
+}
+
+function isWhitelistedHost(target: string): boolean {
+	return whitelistedHosts().has(target);
+}
+
 function validatePathLike(value: string, label: string): void {
 	if (hasControlChars(value)) throw new Error(`${label} contains a newline or control character`);
 	if (value === "~" || value.startsWith("~/")) throw new Error(`${label}: ~ expansion is not supported in SSH Read-only Mode v1`);
 }
 
 function bashSshBlockReason(command: string): string | undefined {
-	if (SSH_COMMAND_RE.test(command) || SHELL_C_SSH_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from invoking SSH client commands. Use sshro_* tools or user-run ! commands instead.";
+	if (SSH_COMMAND_RE.test(command) || SHELL_C_SSH_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from invoking SSH client commands. Use sshro_connect, sshro_* tools, or user-run ! commands instead.";
 	if (SSH_TRANSPORT_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from using SSH transport URLs.";
 	if (SSH_ENV_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from configuring SSH transport environment variables.";
 	return undefined;
@@ -447,6 +459,52 @@ async function startupCheck(target: string): Promise<string> {
 	const missing = checkLines.filter((l) => l.startsWith("MISSING:")).map((l) => l.slice("MISSING:".length));
 	if (missing.length > 0) throw new Error(`remote host is missing required commands: ${missing.join(", ")}`);
 	return cwd;
+}
+
+function registerSshRoConnectTool(pi: ExtensionAPI): void {
+	if (connectToolRegistered) return;
+	connectToolRegistered = true;
+	pi.registerTool({
+		name: SSHRO_CONNECT_TOOL,
+		label: SSHRO_CONNECT_TOOL,
+		description: "Ask to enter SSH Read-only Mode for an SSH target. Targets in SSHRO_HOST_WHITELIST auto-connect; other targets require human approval.",
+		promptSnippet: "sshro_connect: Request SSH Read-only Mode for an SSH target. Targets in SSHRO_HOST_WHITELIST auto-connect; other targets require human approval.",
+		parameters: Type.Object({
+			target: Type.String({ description: "SSH target to connect to, e.g. user@host or an OpenSSH Host alias" }),
+		}),
+		executionMode: "parallel",
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			const target = params.target.trim();
+			try {
+				validateTarget(target);
+				if (connectInProgressTarget) {
+					return textResult(`SSH Read-only connection already in progress for ${connectInProgressTarget}`, true);
+				}
+				connectInProgressTarget = target;
+				const whitelisted = isWhitelistedHost(target);
+				if (!whitelisted) {
+					if (!ctx.hasUI) {
+						return textResult(`SSH Read-only connection to ${target} requires human approval because it is not in ${SSHRO_HOST_WHITELIST_ENV}, but no UI is available.`, true);
+					}
+					const approved = await ctx.ui.confirm(
+						"Approve SSH Read-only connection?",
+						`The agent wants to enter SSH Read-only Mode for:\n\n${target}\n\nOnly the curated sshro_* read-only diagnostic tools will be active after connection.`,
+						{ signal },
+					);
+					if (!approved) return textResult(`SSH Read-only connection to ${target} was denied by the human.`);
+				}
+				await activateSshRo(pi, ctx, target);
+				return textResult(whitelisted ? `SSH Read-only Mode active for ${target} via ${SSHRO_HOST_WHITELIST_ENV}.` : `SSH Read-only Mode active for ${target} after human approval.`);
+			} catch (err) {
+				return textResult(err instanceof Error ? err.message : String(err), true);
+			} finally {
+				connectInProgressTarget = undefined;
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold(SSHRO_CONNECT_TOOL))} ${theme.fg("accent", args.target ?? "...")}`, 0, 0);
+		},
+	});
 }
 
 function registerSshRoTools(pi: ExtensionAPI): void {
@@ -964,9 +1022,9 @@ async function activateSshRo(pi: ExtensionAPI, ctx: ExtensionContext, target: st
 		throw new Error(`SSH Read-only Mode is already active for ${state.target}. Run /sshro logout first.`);
 	}
 	validateTarget(target);
-	registerSshRoTools(pi);
 	const remoteCwd = await startupCheck(target);
 	previousActiveTools = pi.getActiveTools();
+	registerSshRoTools(pi);
 	state = { active: true, target, remoteCwd, fatal: false };
 	pi.setActiveTools([...TOOL_NAMES]);
 	ctx.ui.setStatus("ssh-ro", ctx.ui.theme.fg("accent", `SSH RO ${target} (! remote)`));
@@ -996,6 +1054,8 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 		type: "string",
 		description: "Start SSH Read-only Mode against an SSH target, e.g. pi --ssh-ro user@server",
 	});
+
+	registerSshRoConnectTool(pi);
 
 	pi.registerCommand("sshro", {
 		description: "Enter SSH Read-only Mode for a known SSH host, or leave it with /sshro logout",
