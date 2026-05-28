@@ -8,4 +8,4 @@ Agent-initiated connection requests preserve human control. The extension valida
 
 Whitelist matching intentionally compares the literal target string passed to `sshro_connect`. The extension does not canonicalize hostnames or parse SSH configuration. OpenSSH still resolves aliases, ProxyJump, identities, ports, and other configuration normally when the connection is made.
 
-Once SSH Read-only Mode is active, `sshro_connect` is removed from the active tool set. The active agent tool surface remains exactly the curated read-only diagnostic tools, and the existing tool gate continues to block all other tool calls.
+Once SSH Read-only Mode is active, `sshro_connect` is removed from the active tool set. The active agent tool surface becomes the curated read-only diagnostic tools plus `sshro_disconnect`, which lets the agent leave SSH Read-only Mode without human approval. The existing tool gate continues to block all other tool calls.

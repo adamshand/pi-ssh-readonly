@@ -10,8 +10,10 @@ type SshRoState =
 	| { active: true; target: string; remoteCwd?: string; fatal: true; reason: string };
 
 const SSHRO_CONNECT_TOOL = "sshro_connect";
+const SSHRO_DISCONNECT_TOOL = "sshro_disconnect";
 const SSHRO_HOST_WHITELIST_ENV = "SSHRO_HOST_WHITELIST";
 const TOOL_NAMES = ["sshro_read", "sshro_ls", "sshro_find", "sshro_grep", "sshro_journalctl", "sshro_systemctl", "sshro_ps", "sshro_ss", "sshro_df", "sshro_docker_ps", "sshro_docker_inspect", "sshro_docker_stats", "sshro_dig"] as const;
+const ACTIVE_SSHRO_TOOL_NAMES = [...TOOL_NAMES, SSHRO_DISCONNECT_TOOL] as const;
 const REQUIRED_REMOTE_COMMANDS = ["file", "find", "grep", "head", "sed", "stat", "tail", "ls"];
 const DEFAULT_LINE_LIMIT = 2000;
 const DEFAULT_BYTE_LIMIT = 50 * 1024;
@@ -422,7 +424,7 @@ function curateDockerInspect(items: unknown[]): unknown {
 }
 
 function sshRoModeNote(target: string, remoteCwd: string): string {
-	return `SSH Read-only Mode active: ${target}\nRemote cwd: ${remoteCwd}\n\nAvailable tools:\n${TOOL_NAMES.join(", ")}\n\nPath notes:\n- Paths are remote paths; relative paths resolve from the remote cwd.\n- ~ is not expanded; use absolute paths like /home/name/... or relative paths from the remote cwd.\n- [blocked] means credential/history/password-manager content is blocked; ask the user to inspect manually if needed.\n- sshro_find shows matching blocked entries but does not descend into blocked directories, so parent searches may not enumerate blocked children.\n- sshro_df defaults to local filesystems only to reduce risk from slow network mounts.
+	return `SSH Read-only Mode active: ${target}\nRemote cwd: ${remoteCwd}\n\nAvailable tools:\n${ACTIVE_SSHRO_TOOL_NAMES.join(", ")}\n\nPath notes:\n- Paths are remote paths; relative paths resolve from the remote cwd.\n- ~ is not expanded; use absolute paths like /home/name/... or relative paths from the remote cwd.\n- [blocked] means credential/history/password-manager content is blocked; ask the user to inspect manually if needed.\n- sshro_find shows matching blocked entries but does not descend into blocked directories, so parent searches may not enumerate blocked children.\n- sshro_df defaults to local filesystems only to reduce risk from slow network mounts.
 - Docker tools are optional fixed read-only inspections. sshro_docker_ps returns compact Docker table output by default; sshro_docker_inspect returns curated JSON and visibly redacts environment variables because Docker metadata can contain secrets.
 - sshro_read supports negative offset values to read from the end of large files using tail.
 - sshro_dig performs fixed, bounded DNS lookups with dig when available on the remote host.
@@ -510,6 +512,23 @@ function registerSshRoConnectTool(pi: ExtensionAPI): void {
 function registerSshRoTools(pi: ExtensionAPI): void {
 	if (toolsRegistered) return;
 	toolsRegistered = true;
+	pi.registerTool({
+		name: SSHRO_DISCONNECT_TOOL,
+		label: SSHRO_DISCONNECT_TOOL,
+		description: "End SSH Read-only Mode and restore the previous active tool set. Does not require human approval.",
+		promptSnippet: "sshro_disconnect: End SSH Read-only Mode and restore the previous active tool set. Use when remote inspection is complete or the user asks to leave SSH Read-only Mode.",
+		parameters: Type.Object({}),
+		executionMode: "parallel",
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			if (!state.active) return textResult("SSH Read-only Mode is not active.");
+			const target = state.target;
+			deactivateSshRo(pi, ctx);
+			return textResult(`SSH Read-only Mode ended for ${target}.`);
+		},
+		renderCall(_args, theme) {
+			return new Text(theme.fg("toolTitle", theme.bold(SSHRO_DISCONNECT_TOOL)), 0, 0);
+		},
+	});
 	const cwd = process.cwd();
 	const readParams = Type.Object({
 		path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
@@ -1026,14 +1045,14 @@ async function activateSshRo(pi: ExtensionAPI, ctx: ExtensionContext, target: st
 	previousActiveTools = pi.getActiveTools();
 	registerSshRoTools(pi);
 	state = { active: true, target, remoteCwd, fatal: false };
-	pi.setActiveTools([...TOOL_NAMES]);
+	pi.setActiveTools([...ACTIVE_SSHRO_TOOL_NAMES]);
 	ctx.ui.setStatus("ssh-ro", ctx.ui.theme.fg("accent", `SSH RO ${target} (! remote)`));
 	ctx.ui.notify(`SSH Read-only Mode: ${target} (remote cwd ${remoteCwd})`, "info");
 	pi.sendMessage({
 		customType: "ssh-ro-info",
 		content: sshRoModeNote(target, remoteCwd),
 		display: true,
-		details: { target, remoteCwd, tools: TOOL_NAMES },
+		details: { target, remoteCwd, tools: ACTIVE_SSHRO_TOOL_NAMES },
 	});
 }
 
@@ -1109,8 +1128,8 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 
 		if (!state.active) return;
 		if (state.fatal) return { block: true, reason: `SSH Read-only Mode startup failed: ${state.reason}` };
-		if (!TOOL_NAMES.includes(event.toolName as (typeof TOOL_NAMES)[number])) {
-			return { block: true, reason: `SSH Read-only Mode allows only: ${TOOL_NAMES.join(", ")}` };
+		if (!ACTIVE_SSHRO_TOOL_NAMES.includes(event.toolName as (typeof ACTIVE_SSHRO_TOOL_NAMES)[number])) {
+			return { block: true, reason: `SSH Read-only Mode allows only: ${ACTIVE_SSHRO_TOOL_NAMES.join(", ")}` };
 		}
 	});
 

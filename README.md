@@ -20,7 +20,7 @@ When SSH Read-only Mode is active, this extension disables all built in tools an
 - sshro_docker_stats
 - sshro_dig
 
-Outside SSH Read-only Mode, the agent can also call `sshro_connect` to request a connection. Targets in `SSHRO_HOST_WHITELIST` auto-connect; other targets require explicit human approval.
+Outside SSH Read-only Mode, the agent can also call `sshro_connect` to request a connection. Targets in `SSHRO_HOST_WHITELIST` auto-connect; other targets require explicit human approval. While SSH Read-only Mode is active, the agent can call `sshro_disconnect` to leave the mode without approval.
 
 It redacts and filters obvious password/secret risks, but doesn't try and catch everything (eg. passwords in `ps` output).  If this is critical in your environment you may want to make changes.
 
@@ -45,6 +45,8 @@ Leave SSH Read-only Mode and restore the previous active tools:
 ```text
 /sshro logout
 ```
+
+The agent can also leave SSH Read-only Mode by calling `sshro_disconnect`; this does not require human approval.
 
 You can also start pi directly in SSH Read-only Mode:
 
