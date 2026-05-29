@@ -118,6 +118,8 @@ agent ALL=(root) NOPASSWD: /usr/bin/ls *
 agent ALL=(root) NOPASSWD: /usr/bin/grep *
 agent ALL=(root) NOPASSWD: /usr/bin/eza -1l --absolute=on -R --color=never --icons=never -- *
 agent ALL=(root) NOPASSWD: /usr/bin/plocate *
+agent ALL=(root) NOPASSWD: /usr/bin/journalctl *
+agent ALL=(root) NOPASSWD: /usr/bin/systemctl --no-pager status *
 ```
 
 Avoid broad rules such as `NOPASSWD: ALL`, `/usr/bin/find *`, or shell access.

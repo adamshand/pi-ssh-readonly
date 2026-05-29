@@ -776,16 +776,20 @@ ${sudoSetupHint(grep.commandPath)}`;
 				const until = optionalString(params.until);
 				const priority = optionalString(params.priority);
 				const grep = optionalString(params.grep);
-				if (unit) args.push("-u", shellWord(unit, "unit"));
-				if (since) args.push("--since", shellWord(since, "since"));
-				if (until) args.push("--until", shellWord(until, "until"));
-				if (priority) args.push("-p", shellWord(priority, "priority"));
+				if (unit) { validatePathLike(unit, "unit"); args.push("-u", unit); }
+				if (since) { validatePathLike(since, "since"); args.push("--since", since); }
+				if (until) { validatePathLike(until, "until"); args.push("--until", until); }
+				if (priority) { validatePathLike(priority, "priority"); args.push("-p", priority); }
 				if (grep) validatePathLike(grep, "grep");
-				const base = `command -v journalctl >/dev/null 2>&1 || { echo 'journalctl not found on remote host' >&2; exit 127; }; journalctl ${args.join(" ")} 2>&1`;
+				const journalctl = await chooseCommand(target, "journalctl", args, signal);
+				const base = `${journalctl.command} 2>&1`;
 				const script = grep ? `${base} | grep -i -- ${shellQuote(grep)} | sed -n '1,${lines}p'` : `${base} | sed -n '1,${lines}p'`;
 				const r = await sshExec(target, script, signal, 45_000);
-				const output = r.stdout + r.stderr;
-				return textResult(appendRemoteMeta(output.trim().length ? truncateText(output, lines) : "No journal output", target, r.remoteTime), r.code !== 0 && output.trim().length === 0);
+				let output = r.stdout + r.stderr;
+				if (/not seeing messages from other users and the system/i.test(output) && !journalctl.usedSudo) output += `
+
+${sudoSetupHint(journalctl.commandPath)}`;
+				return textResult(appendSudoNote(output.trim().length ? truncateText(output, lines) : "No journal output", journalctl.usedSudo, journalctl.sudoReason, target, r.remoteTime), r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -809,15 +813,15 @@ ${sudoSetupHint(grep.commandPath)}`;
 				const unit = optionalString(params.unit);
 				if ((action === "status" || action === "show") && !unit) throw new Error(`sshro_systemctl action '${action}' requires unit`);
 				if (unit) validatePathLike(unit, "unit");
-				let cmd: string;
-				if (action === "failed") cmd = "systemctl --no-pager --plain --failed";
-				else if (action === "list") cmd = "systemctl --no-pager --plain list-units --type=service --all";
-				else if (action === "status") cmd = `systemctl --no-pager --plain status ${shellQuote(unit!)}`;
-				else cmd = `systemctl show ${shellQuote(unit!)} --property=Id,Names,Description,LoadState,ActiveState,SubState,UnitFileState,Result,ExecMainCode,ExecMainStatus,MainPID,FragmentPath,DropInPaths,Requires,Wants,After,Before,Restart,RestartUSec,StartLimitBurst,StartLimitIntervalUSec`;
-				const script = `command -v systemctl >/dev/null 2>&1 || { echo 'systemctl not found on remote host' >&2; exit 127; }; ${cmd} 2>&1 | sed -n '1,${DEFAULT_LINE_LIMIT}p'`;
-				const r = await sshExec(target, script, signal, 30_000);
+				let args: string[];
+				if (action === "failed") args = ["--no-pager", "--plain", "--failed"];
+				else if (action === "list") args = ["--no-pager", "--plain", "list-units", "--type=service", "--all"];
+				else if (action === "status") args = ["--no-pager", "status", unit!];
+				else args = ["show", unit!, "--property=Id,Names,Description,LoadState,ActiveState,SubState,UnitFileState,Result,ExecMainCode,ExecMainStatus,MainPID,FragmentPath,DropInPaths,Requires,Wants,After,Before,Restart,RestartUSec,StartLimitBurst,StartLimitIntervalUSec"];
+				const systemctl = await chooseCommand(target, "systemctl", args, signal);
+				const r = await sshExec(target, `${systemctl.command} 2>&1 | sed -n '1,${DEFAULT_LINE_LIMIT}p'`, signal, 30_000);
 				const output = r.stdout + r.stderr;
-				return textResult(appendRemoteMeta(truncateText(output || "No systemctl output"), target, r.remoteTime), r.code !== 0 && output.trim().length === 0);
+				return textResult(appendSudoNote(truncateText(output || "No systemctl output"), systemctl.usedSudo, systemctl.sudoReason, target, r.remoteTime), r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
 				return errorResult(err);
 			}
