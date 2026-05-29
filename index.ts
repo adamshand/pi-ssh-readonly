@@ -10,7 +10,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DENIED_DIR_NAMES = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".terraform", ".terraform.d", ".cloudflared", ".cloudflare", ".password-store"];
 const DENIED_PATH_PARTS = ["/.config/gcloud", "/.config/gh", "/.config/Bitwarden CLI", "/.config/Bitwarden", "/.config/bitwarden", "/.config/1Password", "/.config/op", "/.config/keepassxc", "/.config/KeePass", "/.config/keepass", "/.config/gopass", "/.config/chezmoi", "/.local/share/fish", "/.local/share/nano", "/.local/share/keepassxc", "/.local/share/gopass", "/.local/share/chezmoi", "/.gem/credentials", "/.cargo/credentials"];
 const DENIED_FILE_NAMES = [".env", ".netrc", ".npmrc", ".pypirc", ".gitconfig", ".git-credentials", "terraform.tfstate", ".chezmoi.toml", ".chezmoi.yaml", ".chezmoi.json", ".chezmoiignore", ".bash_history", ".zsh_history", ".zhistory", ".fish_history", "fish_history", ".sh_history", ".ash_history", ".history", "search_history", ".mysql_history", ".psql_history", ".sqlite_history", ".python_history", ".node_repl_history", ".rediscli_history", ".lesshst", ".wget-hsts"];
-const DENIED_FILE_SUFFIXES = [".pem", ".key", ".p12", ".pfx", "_history"];
+const DENIED_FILE_SUFFIXES = [".env", ".pem", ".key", ".p12", ".pfx", "_history"];
 const DENIED_FILE_PREFIXES = [".env.", "terraform.tfstate."];
 const SSH_CLIENT_COMMAND_PATTERN = String.raw`(?:ssh|scp|sftp|sshfs|ssh-keyscan|sshpass|autossh|mosh|slogin|plink|pscp|psftp)`;
 const SSH_COMMAND_RE = new RegExp(
@@ -160,11 +160,16 @@ function truncateText(text: string, maxLines = DEFAULT_LINE_LIMIT, maxBytes = DE
 	return out;
 }
 
+const REMOTE_TIME_MARKER = "__PI_SSHRO_REMOTE_TIME__";
+
+type SshExecResult = { stdout: string; stderr: string; code: number | null; remoteTime?: string };
+
 function spawnSsh(target: string, command: string) {
 	// Force POSIX sh for remote command templates. OpenSSH normally passes the
 	// command through the user's login shell; many legacy/admin accounts use
 	// fish/csh/etc., which do not understand POSIX for/if syntax.
-	const remoteCommand = `sh -c ${shellQuote(command)}`;
+	const wrapped = `( ${command} ); __pi_sshro_rc=$?; printf '\n${REMOTE_TIME_MARKER}%s\n' "$(date -Is 2>/dev/null || date)" >&2; exit "$__pi_sshro_rc"`;
+	const remoteCommand = `sh -c ${shellQuote(wrapped)}`;
 	return spawn(
 		"ssh",
 		["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", target, remoteCommand],
@@ -172,7 +177,19 @@ function spawnSsh(target: string, command: string) {
 	);
 }
 
-function sshExec(target: string, command: string, signal?: AbortSignal, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<{ stdout: string; stderr: string; code: number | null }> {
+function stripRemoteTime(stderr: string): { stderr: string; remoteTime?: string } {
+	let remoteTime: string | undefined;
+	const lines = stderr.split(/\r?\n/).filter((line) => {
+		if (line.startsWith(REMOTE_TIME_MARKER)) {
+			remoteTime = line.slice(REMOTE_TIME_MARKER.length).trim();
+			return false;
+		}
+		return true;
+	});
+	return { stderr: lines.join("\n").trimEnd(), remoteTime };
+}
+
+function sshExec(target: string, command: string, signal?: AbortSignal, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<SshExecResult> {
 	return new Promise((resolve, reject) => {
 		const child = spawnSsh(target, command);
 		const stdout: Buffer[] = [];
@@ -196,7 +213,10 @@ function sshExec(target: string, command: string, signal?: AbortSignal, timeoutM
 			signal?.removeEventListener("abort", onAbort);
 			if (signal?.aborted) reject(new Error("SSH command aborted"));
 			else if (timedOut) reject(new Error(`SSH command timed out after ${timeoutMs / 1000}s`));
-			else resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"), code });
+			else {
+				const parsed = stripRemoteTime(Buffer.concat(stderr).toString("utf8"));
+				resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: parsed.stderr, remoteTime: parsed.remoteTime, code });
+			}
 		});
 	});
 }
@@ -269,8 +289,17 @@ function sudoNote(usedSudo: boolean, sudoReason: string): string {
 	return "[ssh-ro note] Used sudo: no; sudo permission was not available for this command.";
 }
 
-function appendSudoNote(output: string, usedSudo: boolean, sudoReason: string): string {
-	return `${output.trimEnd()}\n\n${sudoNote(usedSudo, sudoReason)}`;
+function remoteMetaFooter(target: string, remoteTime?: string): string {
+	return `[ssh-ro: ${target}${remoteTime ? ` | remote time: ${remoteTime}` : ""}]`;
+}
+
+function appendRemoteMeta(output: string, target: string, remoteTime?: string): string {
+	return `${output.trimEnd()}\n\n${remoteMetaFooter(target, remoteTime)}`;
+}
+
+function appendSudoNote(output: string, usedSudo: boolean, sudoReason: string, target?: string, remoteTime?: string): string {
+	const withSudo = `${output.trimEnd()}\n\n${sudoNote(usedSudo, sudoReason)}`;
+	return target ? appendRemoteMeta(withSudo, target, remoteTime) : withSudo;
 }
 
 function permissionDenied(text: string): boolean {
@@ -573,7 +602,7 @@ ${r.stderr}`;
 				if (failed && permissionDenied(output) && !read.usedSudo) output += `
 
 ${sudoSetupHint(read.commandPath)}`;
-				return textResult(appendSudoNote(truncateText(output), read.usedSudo, read.sudoReason), failed);
+				return textResult(appendSudoNote(truncateText(output), read.usedSudo, read.sudoReason, target, r.remoteTime), failed);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -611,7 +640,7 @@ ${r.stderr}` : ""}`;
 				if (failed && permissionDenied(combined) && !chosen.usedSudo) combined += `
 
 ${sudoSetupHint(chosen.commandPath, ezaPath ? "-1l --absolute=on -R --color=never --icons=never -- *" : "*")}`;
-				return textResult(appendSudoNote(truncateText(combined, limit), chosen.usedSudo, chosen.sudoReason), failed);
+				return textResult(appendSudoNote(truncateText(combined, limit), chosen.usedSudo, chosen.sudoReason, target, r.remoteTime), failed);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -645,7 +674,7 @@ ${output}`;
 				if (r.code !== 0 && permissionDenied(output) && !locate.usedSudo) output += `
 
 ${sudoSetupHint(locate.commandPath)}`;
-				return textResult(appendSudoNote(truncateText(output, limit), locate.usedSudo, locate.sudoReason), r.code !== 0 && r.stdout.trim().length === 0);
+				return textResult(appendSudoNote(truncateText(output, limit), locate.usedSudo, locate.sudoReason, target, r.remoteTime), r.code !== 0 && r.stdout.trim().length === 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -694,7 +723,7 @@ ${sudoSetupHint(locate.commandPath)}`;
 
 ${sudoSetupHint(grep.commandPath)}`;
 				output = appendSearchErrorSummary(output, r.stderr, showErrors, errorLimit);
-				return textResult(appendSudoNote(output, grep.usedSudo, grep.sudoReason), failed);
+				return textResult(appendSudoNote(output, grep.usedSudo, grep.sudoReason, target, r.remoteTime), failed);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -730,7 +759,7 @@ ${sudoSetupHint(grep.commandPath)}`;
 				const script = grep ? `${base} | grep -i -- ${shellQuote(grep)} | sed -n '1,${lines}p'` : `${base} | sed -n '1,${lines}p'`;
 				const r = await sshExec(target, script, signal, 45_000);
 				const output = r.stdout + r.stderr;
-				return textResult(output.trim().length ? truncateText(output, lines) : "No journal output", r.code !== 0 && output.trim().length === 0);
+				return textResult(appendRemoteMeta(output.trim().length ? truncateText(output, lines) : "No journal output", target, r.remoteTime), r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -762,7 +791,7 @@ ${sudoSetupHint(grep.commandPath)}`;
 				const script = `command -v systemctl >/dev/null 2>&1 || { echo 'systemctl not found on remote host' >&2; exit 127; }; ${cmd} 2>&1 | sed -n '1,${DEFAULT_LINE_LIMIT}p'`;
 				const r = await sshExec(target, script, signal, 30_000);
 				const output = r.stdout + r.stderr;
-				return textResult(truncateText(output || "No systemctl output"), r.code !== 0 && output.trim().length === 0);
+				return textResult(appendRemoteMeta(truncateText(output || "No systemctl output"), target, r.remoteTime), r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -796,7 +825,7 @@ ${sudoSetupHint(grep.commandPath)}`;
 				const output = r.stdout + r.stderr;
 				const noMatches = output.trim().length === 0 || psHasOnlyHeader(output);
 				const filters = [user ? `user=${user}` : undefined, pattern ? `pattern=${pattern}` : undefined].filter(Boolean).join(" ");
-				return textResult(noMatches ? `No matching processes${filters ? ` for ${filters}` : ""}` : truncateText(output, limit), r.code !== 0 && output.trim().length === 0);
+				return textResult(appendRemoteMeta(noMatches ? `No matching processes${filters ? ` for ${filters}` : ""}` : truncateText(output, limit), target, r.remoteTime), r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -829,7 +858,7 @@ ${sudoSetupHint(grep.commandPath)}`;
 						? "\n[ssh-ro note] processInfo=true was requested; process ownership details may still be partial without elevated privileges.\n"
 						: "\n[ssh-ro note] processInfo=true was requested, but no process ownership details were visible. This usually means the SSH user lacks permission to inspect socket owners.\n";
 				}
-				return textResult(output.trim().length ? truncateText(output, limit) : "No socket output", r.code !== 0 && output.trim().length === 0);
+				return textResult(appendRemoteMeta(output.trim().length ? truncateText(output, limit) : "No socket output", target, r.remoteTime), r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -859,7 +888,7 @@ ${sudoSetupHint(grep.commandPath)}`;
 				const script = `df ${flags.join(" ")}${resolvedPath ? ` ${shellQuote(resolvedPath)}` : ""} 2>&1 | sed -n '1,${DEFAULT_LINE_LIMIT}p'`;
 				const r = await sshExec(target, script, signal, 15_000);
 				const output = r.stdout + r.stderr;
-				return textResult(output.trim().length ? truncateText(output) : "No df output", r.code !== 0 && output.trim().length === 0);
+				return textResult(appendRemoteMeta(output.trim().length ? truncateText(output) : "No df output", target, r.remoteTime), r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -886,11 +915,11 @@ ${sudoSetupHint(grep.commandPath)}`;
 				if (name) args.push("--filter", shellQuote(`name=${name}`));
 				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker ps ${args.join(" ")}`;
 				const r = await sshExec(target, script, signal, 20_000);
-				if (r.code !== 0) return textResult(`docker ps failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
+				if (r.code !== 0) return textResult(appendRemoteMeta(`docker ps failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, target, r.remoteTime), true);
 				if (hasOnlyHeader(r.stdout)) {
-					return textResult(params.all ? "No Docker containers found." : "No active Docker containers. Use all=true to include stopped/exited containers.");
+					return textResult(appendRemoteMeta(params.all ? "No Docker containers found." : "No active Docker containers. Use all=true to include stopped/exited containers.", target, r.remoteTime));
 				}
-				return textResult(truncateRowsWithHeader(r.stdout, limit, "containers"));
+				return textResult(appendRemoteMeta(truncateRowsWithHeader(r.stdout, limit, "containers"), target, r.remoteTime));
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -916,13 +945,13 @@ ${sudoSetupHint(grep.commandPath)}`;
 				const args = kind ? [`--type`, shellQuote(kind), shellQuote(params.object)] : [shellQuote(params.object)];
 				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker inspect ${args.join(" ")}`;
 				const r = await sshExec(target, script, signal, 20_000);
-				if (r.code !== 0) return textResult(`docker inspect failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
+				if (r.code !== 0) return textResult(appendRemoteMeta(`docker inspect failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, target, r.remoteTime), true);
 				try {
 					const parsed = JSON.parse(r.stdout);
 					const output = curateDockerInspect(Array.isArray(parsed) ? parsed : [parsed]);
-					return textResult(prettyJson(output));
+					return textResult(appendRemoteMeta(prettyJson(output), target, r.remoteTime));
 				} catch (err) {
-					return textResult(`docker inspect JSON output was unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, true);
+					return textResult(appendRemoteMeta(`docker inspect JSON output was unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, target, r.remoteTime), true);
 				}
 			} catch (err) {
 				return errorResult(err);
@@ -948,12 +977,12 @@ ${sudoSetupHint(grep.commandPath)}`;
 				if (container) validateDockerRef(container, "container");
 				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker stats --no-stream --format '{{json .}}'${container ? ` ${shellQuote(container)}` : ""}`;
 				const r = await sshExec(target, script, signal, 20_000);
-				if (r.code !== 0) return textResult(`docker stats failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
+				if (r.code !== 0) return textResult(appendRemoteMeta(`docker stats failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, target, r.remoteTime), true);
 				try {
 					const rows = parseNdjson(r.stdout);
-					return textResult(prettyJsonRows(rows, limit, "stat rows"));
+					return textResult(appendRemoteMeta(prettyJsonRows(rows, limit, "stat rows"), target, r.remoteTime));
 				} catch (err) {
-					return textResult(`docker stats JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, true);
+					return textResult(appendRemoteMeta(`docker stats JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, target, r.remoteTime), true);
 				}
 			} catch (err) {
 				return errorResult(err);
@@ -985,7 +1014,7 @@ ${sudoSetupHint(grep.commandPath)}`;
 				const script = `command -v dig >/dev/null 2>&1 || { echo 'dig not found on remote host' >&2; exit 127; }; dig ${args.join(" ")}`;
 				const r = await sshExec(target, script, signal, 10_000);
 				const output = r.stdout + r.stderr;
-				return textResult(output.trim().length ? truncateText(output, 500) : "No DNS answer", r.code !== 0);
+				return textResult(appendRemoteMeta(output.trim().length ? truncateText(output, 500) : "No DNS answer", target, r.remoteTime), r.code !== 0);
 			} catch (err) {
 				return errorResult(err);
 			}

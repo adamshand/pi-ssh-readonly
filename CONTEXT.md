@@ -50,12 +50,13 @@ _Avoid_: hidden permission errors, silent stderr suppression
 - If `sudo -n -l` reports that a password/tty is required or the exact command is not allowed, the tool falls back to the non-sudo command and reports that elevated access was unavailable.
 - Sudo capability checks are cached per Pi session by target, command path, and exact arguments.
 - If a non-sudo fallback fails with permission denied and sudo was unavailable, tool output includes a human-facing sudoers setup hint for the relevant fixed command.
+- Each SSH command appends a remote time marker to stderr; `sshExec` strips the marker from stderr and tool results include a footer such as `[ssh-ro: target | remote time: 2026-05-29T22:14:03+12:00]` for log/mtime context.
 - `sshro_read` keeps `path`, `offset`, and `limit`. It reads through fixed `cat -- path`, optionally via sudo after approval, then applies line slicing with remote `head`/`tail`.
 - `sshro_ls` returns metadata, includes hidden files by default, and supports `recursive: true` for live recursive listings.
 - Recursive `sshro_ls` prefers `eza -1l --absolute=on -R --color=never --icons=never -- path`, filters eza grouping-folder headers, and falls back to `ls -laR` when `eza` is unavailable.
 - `sshro_locate` uses `plocate` for fast indexed path search. Results may be stale. No regex option is exposed initially.
 - `sshro_grep` uses `grep -E` by default, searches directories recursively with `grep -R`, skips binary files, supports `glob`, and uses `grep -F` when `literal: true`.
-- Recursive `sshro_grep` excludes `.git`, `node_modules`, and common credential/history/password-manager/dotfile-manager paths by default. This is not a chroot or adversarial DLP boundary.
+- Direct content reads and recursive grep exclude `.env`, `*.env`, shell history, private key/certificate extensions, `.git`, `node_modules`, and common credential/history/password-manager/dotfile-manager paths by default. This is not a chroot or adversarial DLP boundary.
 - Tool paths and patterns reject newlines/control characters while allowing ordinary spaces and punctuation through shell quoting.
 - Tool-specific SSH timeouts and pi-like output limits bound remote inspections.
 - Docker tools are optional runtime diagnostics. `sshro_docker_inspect` uses `target` for the SSH target and `object` for the Docker object name/ID.

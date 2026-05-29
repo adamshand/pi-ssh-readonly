@@ -102,11 +102,13 @@ Host *
   ControlPersist 900
 ```
 
-`index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. .env, shell history files, SSH/cloud credential directories, password-manager data, chezmoi data). Listings still show blocked entries with a compact `[blocked]` marker where possible so the agent knows they exist and can ask for help if needed. Recursive `sshro_grep` excludes blocked credential/history/password-manager paths. `sshro_grep` uses extended regex (`grep -E`) by default; use `literal=true` for fixed-string search. If you have specific requirements edit this.
+`index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. `.env`, `*.env`, shell history files, SSH/cloud credential directories, password-manager data, chezmoi data). Listings still show blocked entries with a compact `[blocked]` marker where possible so the agent knows they exist and can ask for help if needed. Recursive `sshro_grep` excludes blocked credential/history/password-manager paths. `sshro_grep` uses extended regex (`grep -E`) by default; use `literal=true` for fixed-string search. If you have specific requirements edit this.
 
 `sshro_ls` supports `recursive=true` for live recursive listings. Recursive listing uses `eza -1l --absolute=on -R --color=never --icons=never` when available, filters eza grouping headers, and falls back to `ls -laR` otherwise.
 
 `sshro_locate` uses `plocate` for very fast indexed path search. Results may be stale depending on how often the server updates its locate database.
+
+Tool results include a compact footer with the SSH target and remote server time, e.g. `[ssh-ro: white | remote time: 2026-05-29T22:14:03+12:00]`, so log and mtime output has clock context without a separate tool call.
 
 Some tools can use elevated read-only access when sudoers allows the exact fixed command. Before running any elevated command the extension checks `sudo -n -l <command ...>`; if sudo requires a password or the command is not allowed, the tool falls back to the non-sudo command and reports that elevated access was unavailable. This avoids noisy failed sudo command attempts. Example sudoers additions for a trusted account on servers you control:
 
