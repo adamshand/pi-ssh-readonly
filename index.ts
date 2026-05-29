@@ -28,6 +28,7 @@ const SSH_ENV_RE = /\b(?:GIT_SSH|GIT_SSH_COMMAND|RSYNC_RSH)\s*=/i;
 
 let toolsRegistered = false;
 const approvedTargets = new Set<string>();
+const pendingTargetApprovals = new Map<string, Promise<boolean>>();
 const remoteCommandCache = new Map<string, string | undefined>();
 const sudoCheckCache = new Map<string, { allowed: boolean; reason: string }>();
 
@@ -237,14 +238,24 @@ async function authorizeTarget(target: string, ctx: ExtensionContext, signal?: A
 	const trimmed = target.trim();
 	validateTarget(trimmed);
 	if (isWhitelistedHost(trimmed) || approvedTargets.has(trimmed)) return trimmed;
-	if (!ctx.hasUI) throw new Error(`SSH read-only tool call to ${trimmed} requires human approval because it is not in ${SSHRO_HOST_WHITELIST_ENV}, but no UI is available.`);
-	const approved = await ctx.ui.confirm(
-		"Approve SSH read-only tool access?",
-		`The agent wants to run read-only SSH inspection tools against:\n\n${trimmed}\n\nApproval is remembered for this Pi session only and matches this exact target string.`,
-		{ signal },
-	);
-	if (!approved) throw new Error(`SSH read-only tool access to ${trimmed} was denied by the human.`);
-	approvedTargets.add(trimmed);
+
+	let approval = pendingTargetApprovals.get(trimmed);
+	if (!approval) {
+		if (!ctx.hasUI) throw new Error(`SSH read-only tool call to ${trimmed} requires human approval because it is not in ${SSHRO_HOST_WHITELIST_ENV}, but no UI is available.`);
+		approval = ctx.ui.confirm(
+			"Approve SSH read-only tool access?",
+			`The agent wants to run read-only SSH inspection tools against:\n\n${trimmed}\n\nApproval is remembered for this Pi session only and matches this exact target string.`,
+			{ signal },
+		).then((approved) => {
+			if (approved) approvedTargets.add(trimmed);
+			return approved;
+		}).finally(() => {
+			pendingTargetApprovals.delete(trimmed);
+		});
+		pendingTargetApprovals.set(trimmed, approval);
+	}
+
+	if (!await approval) throw new Error(`SSH read-only tool access to ${trimmed} was denied by the human.`);
 	return trimmed;
 }
 
@@ -1039,6 +1050,7 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 			const value = (args ?? "").trim();
 			if (value === "logout") {
 				approvedTargets.clear();
+				pendingTargetApprovals.clear();
 				ctx.ui.notify("SSH read-only session approvals cleared", "info");
 				return;
 			}
