@@ -9,7 +9,7 @@ const DEFAULT_BYTE_LIMIT = 50 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DENIED_DIR_NAMES = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".terraform", ".terraform.d", ".cloudflared", ".cloudflare", ".password-store"];
 const DENIED_PATH_PARTS = ["/.config/gcloud", "/.config/gh", "/.config/Bitwarden CLI", "/.config/Bitwarden", "/.config/bitwarden", "/.config/1Password", "/.config/op", "/.config/keepassxc", "/.config/KeePass", "/.config/keepass", "/.config/gopass", "/.config/chezmoi", "/.local/share/fish", "/.local/share/nano", "/.local/share/keepassxc", "/.local/share/gopass", "/.local/share/chezmoi", "/.gem/credentials", "/.cargo/credentials"];
-const DENIED_FILE_NAMES = [".env", ".netrc", ".npmrc", ".pypirc", ".gitconfig", ".git-credentials", "terraform.tfstate", ".chezmoi.toml", ".chezmoi.yaml", ".chezmoi.json", ".chezmoiignore", ".bash_history", ".zsh_history", ".zhistory", ".fish_history", "fish_history", ".sh_history", ".ash_history", ".history", "search_history", ".mysql_history", ".psql_history", ".sqlite_history", ".python_history", ".node_repl_history", ".rediscli_history", ".lesshst", ".wget-hsts"];
+const DENIED_FILE_NAMES = [".env", ".netrc", ".npmrc", ".pypirc", ".gitconfig", ".git-credentials", "terraform.tfstate", ".chezmoi.toml", ".chezmoi.yaml", ".chezmoi.json", ".chezmoiignore", ".bash_history", ".zsh_history", ".zhistory", ".fish_history", "fish_history", ".sh_history", ".ash_history", ".history", "search_history", ".mysql_history", ".psql_history", ".sqlite_history", ".python_history", ".node_repl_history", ".rediscli_history", ".lesshst", ".wget-hsts", "environ", "kcore"];
 const DENIED_FILE_SUFFIXES = [".env", ".pem", ".key", ".p12", ".pfx", "_history"];
 const DENIED_FILE_PREFIXES = [".env.", "terraform.tfstate."];
 const SSH_CLIENT_COMMAND_PATTERN = String.raw`(?:ssh|scp|sftp|sshfs|ssh-keyscan|sshpass|autossh|mosh|slogin|plink|pscp|psftp)`;
@@ -312,6 +312,10 @@ function appendSudoNote(output: string, usedSudo: boolean, sudoReason: string, t
 	return target ? appendRemoteMeta(output, target, remoteTime, sudoMeta(usedSudo, sudoReason)) : `${output.trimEnd()}\n\n[ssh-ro: ${sudoMeta(usedSudo, sudoReason)}]`;
 }
 
+function isAllowedTextMime(mime: string): boolean {
+	return mime.startsWith("text/") || ["inode/x-empty", "application/x-empty", "application/json", "application/xml", "application/x-shellscript", "application/x-perl", "application/x-python", "application/javascript", "application/x-yaml"].includes(mime);
+}
+
 function permissionDenied(text: string): boolean {
 	return /permission denied|operation not permitted/i.test(text);
 }
@@ -606,15 +610,15 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const limit = validatePositiveLimit(params.limit, "limit", DEFAULT_LINE_LIMIT);
 				const rangeLabel = offset < 0 ? `last ${Math.abs(offset)} lines${params.limit !== undefined ? `, limited to ${limit}` : ""}` : `${offset}-${offset + limit - 1}`;
 				const read = await chooseCommand(target, "cat", ["--", p], signal);
+				const mimeCheck = await sshExec(target, `${read.command} 2>/dev/null | head -c 4096 | file --mime-type -b -`, signal, 15_000);
+				const mime = mimeCheck.stdout.trim().split(/\r?\n/, 1)[0] || "unknown";
+				if (!isAllowedTextMime(mime)) throw new Error(`refusing non-text file (${mime}): ${p}`);
 				const slice = offset < 0
 					? `tail -n ${Math.abs(offset)}${params.limit !== undefined ? ` | head -n ${limit}` : ""}`
 					: offset === 1
 						? `head -n ${limit}`
 						: `tail -n +${offset} | head -n ${limit}`;
-				const script = `printf 'path: %s
-lines: %s
----
-' ${shellQuote(p)} ${shellQuote(rangeLabel)}; ${read.command} | ${slice}`;
+				const script = `printf 'path: %s\nmime: %s\nlines: %s\n---\n' ${shellQuote(p)} ${shellQuote(mime)} ${shellQuote(rangeLabel)}; ${read.command} | ${slice}`;
 				const r = await sshExec(target, script, signal);
 				let output = r.stdout;
 				if (r.stderr) output += `
