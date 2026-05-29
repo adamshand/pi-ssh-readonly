@@ -46,7 +46,7 @@ Leave SSH Read-only Mode and restore the previous active tools:
 /sshro logout
 ```
 
-The agent can also leave SSH Read-only Mode by calling `sshro_disconnect`; this does not require human approval.
+The agent can also leave SSH Read-only Mode by calling `sshro_disconnect`; this does not require human approval. If the agent calls `sshro_disconnect` when SSH Read-only Mode is not connected, the tool returns a clear "not connected" message with reconnect guidance.
 
 You can also start pi directly in SSH Read-only Mode:
 
@@ -60,7 +60,9 @@ Connection approval is only for agent-initiated `sshro_connect` calls:
 
 - Human-initiated `/sshro <target>` and `pi --ssh-ro <target>` do not consult the whitelist.
 - Whitelist matches use the exact target string passed to `sshro_connect`; `binney` and `adam@binney` are different entries.
-- After connection, `sshro_connect` is no longer active; the agent gets the read-only `sshro_*` tools plus `sshro_disconnect`.
+- After connection, the agent gets the read-only `sshro_*` tools plus `sshro_disconnect`.
+- If an agent retries `sshro_connect` after connection, the tool returns a clear "already connected" message instead of prompting again.
+- If an agent tries an `sshro_*` inspection tool while disconnected, the tool returns a clear "not connected" message explaining that it should call `sshro_connect` first.
 
 **Requires passwordless SSH and an existing known_hosts entry. It will not prompt for a password or accept unknown hosts.**
 

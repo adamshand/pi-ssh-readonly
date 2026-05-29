@@ -272,6 +272,34 @@ function textResult(text: string, isError = false) {
 	return { content: [{ type: "text" as const, text }], isError };
 }
 
+function errorResult(err: unknown) {
+	const message = err instanceof Error ? err.message : String(err);
+	const result = textResult(message, true);
+	return message.includes("SSH Read-only Mode is not connected right now") ? { ...result, terminate: true } : result;
+}
+
+function sshRoConnectActiveMessage(target: string, remoteCwd: string, suffix: string): string {
+	return `SSH Read-only Mode active for ${target}${suffix}.\nRemote cwd: ${remoteCwd}\n\nYou are connected now. Use these tools for remote inspection: ${ACTIVE_SSHRO_TOOL_NAMES.join(", ")}. Do not call ${SSHRO_CONNECT_TOOL} again while SSH Read-only Mode is active; use ${SSHRO_DISCONNECT_TOOL} to leave.`;
+}
+
+function sshRoConnectAlreadyActiveMessage(requestedTarget: string, activeTarget: string, remoteCwd: string): string {
+	const requested = requestedTarget === activeTarget ? "" : ` The requested target was ${requestedTarget}; no new connection was attempted.`;
+	return `Already in SSH Read-only Mode for ${activeTarget}.${requested}\nRemote cwd: ${remoteCwd}\n\nContinue with the sshro_* read-only tools. Do not call ${SSHRO_CONNECT_TOOL} again while SSH Read-only Mode is active; use ${SSHRO_DISCONNECT_TOOL} to leave.`;
+}
+
+function sshRoInactiveMessage(prefix = "SSH Read-only Mode is not connected right now."): string {
+	return `${prefix}\n\nTo inspect a remote server, call ${SSHRO_CONNECT_TOOL} with an SSH target. For automatic approval, use a whitelist target exactly as listed. If you do not know which target to use, ask the user.\n\n${whitelistedHostsPromptHint()}`;
+}
+
+function queueSshRoReadyFollowUp(pi: ExtensionAPI, target: string, remoteCwd: string): void {
+	pi.sendMessage({
+		customType: "ssh-ro-ready",
+		content: `SSH Read-only Mode is active for ${target}.\nRemote cwd: ${remoteCwd}\n\nThe tool set has changed. Continue the user's previous request using the active sshro_* read-only tools. Do not call ${SSHRO_CONNECT_TOOL} again while SSH Read-only Mode is active; use ${SSHRO_DISCONNECT_TOOL} only when remote inspection is complete or the user asks to leave SSH Read-only Mode.`,
+		display: false,
+		details: { target, remoteCwd, tools: ACTIVE_SSHRO_TOOL_NAMES },
+	}, { deliverAs: "followUp", triggerTurn: true });
+}
+
 function optionalString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
@@ -437,11 +465,12 @@ function sshRoModeNote(target: string, remoteCwd: string): string {
 - Docker tools are optional fixed read-only inspections. sshro_docker_ps returns compact Docker table output by default; sshro_docker_inspect returns curated JSON and visibly redacts environment variables because Docker metadata can contain secrets.
 - sshro_read supports negative offset values to read from the end of large files using tail.
 - sshro_dig performs fixed, bounded DNS lookups with dig when available on the remote host.
+- SSH Read-only Mode is already connected; use the listed sshro_* tools and do not call sshro_connect again unless after sshro_disconnect.
 - User ! and !! commands run on the SSH target while SSH Read-only Mode is active; !! still excludes output from model context. Remote command output ends with an [ssh-ro: target:remoteCwd] footer.`;
 }
 
 function requireHealthy(): { target: string; remoteCwd: string } {
-	if (!state.active) throw new Error("SSH Read-only Mode is not active");
+	if (!state.active) throw new Error(sshRoInactiveMessage());
 	if (state.fatal) throw new Error(`SSH Read-only Mode startup failed: ${state.reason}`);
 	return { target: state.target, remoteCwd: state.remoteCwd };
 }
@@ -489,6 +518,10 @@ function registerSshRoConnectTool(pi: ExtensionAPI): void {
 			const target = params.target.trim();
 			try {
 				validateTarget(target);
+				if (state.active && !state.fatal) {
+					queueSshRoReadyFollowUp(pi, state.target, state.remoteCwd);
+					return { ...textResult(sshRoConnectAlreadyActiveMessage(target, state.target, state.remoteCwd)), terminate: true };
+				}
 				if (connectInProgressTarget) {
 					return textResult(`SSH Read-only connection already in progress for ${connectInProgressTarget}`, true);
 				}
@@ -506,9 +539,11 @@ function registerSshRoConnectTool(pi: ExtensionAPI): void {
 					if (!approved) return textResult(`SSH Read-only connection to ${target} was denied by the human.`);
 				}
 				await activateSshRo(pi, ctx, target);
-				return textResult(whitelisted ? `SSH Read-only Mode active for ${target} via ${SSHRO_HOST_WHITELIST_ENV}.` : `SSH Read-only Mode active for ${target} after human approval.`);
+				const remoteCwd = state.active && !state.fatal ? state.remoteCwd : "<unknown>";
+				queueSshRoReadyFollowUp(pi, target, remoteCwd);
+				return { ...textResult(sshRoConnectActiveMessage(target, remoteCwd, whitelisted ? ` via ${SSHRO_HOST_WHITELIST_ENV}` : " after human approval")), terminate: true };
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			} finally {
 				connectInProgressTarget = undefined;
 			}
@@ -530,10 +565,10 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		parameters: Type.Object({}),
 		executionMode: "parallel",
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			if (!state.active) return textResult("SSH Read-only Mode is not active.");
+			if (!state.active) return { ...textResult(sshRoInactiveMessage("SSH Read-only Mode is not connected right now, so there is nothing to disconnect.")), terminate: true };
 			const target = state.target;
 			deactivateSshRo(pi, ctx);
-			return textResult(`SSH Read-only Mode ended for ${target}.`);
+			return { ...textResult(`SSH Read-only Mode ended for ${target}. To inspect a remote server again, call ${SSHRO_CONNECT_TOOL} with a target.`), terminate: true };
 		},
 		renderCall(_args, theme) {
 			return new Text(theme.fg("toolTitle", theme.bold(SSHRO_DISCONNECT_TOOL)), 0, 0);
@@ -641,7 +676,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const out = await sshChecked(target, script, signal);
 				return textResult(truncateText(out));
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -668,7 +703,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const combined = `${stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}`;
 				return textResult(truncateText(combined, limit), r.code !== 0);
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -702,7 +737,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const output = matches.trim().length ? truncateText(matches, limit) : "No matches";
 				return textResult(appendSearchErrorSummary(output, r.stderr, showErrors, errorLimit), r.code !== 0 && r.stdout.trim().length === 0 && r.stderr.trim().length === 0);
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -740,7 +775,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const output = r.stdout.trim().length ? truncateText(r.stdout, limit) : "No matches";
 				return textResult(appendSearchErrorSummary(output, r.stderr, showErrors, errorLimit));
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -776,7 +811,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const output = r.stdout + r.stderr;
 				return textResult(output.trim().length ? truncateText(output, lines) : "No journal output", r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -808,7 +843,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const output = r.stdout + r.stderr;
 				return textResult(truncateText(output || "No systemctl output"), r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -842,7 +877,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const filters = [user ? `user=${user}` : undefined, pattern ? `pattern=${pattern}` : undefined].filter(Boolean).join(" ");
 				return textResult(noMatches ? `No matching processes${filters ? ` for ${filters}` : ""}` : truncateText(output, limit), r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -875,7 +910,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				}
 				return textResult(output.trim().length ? truncateText(output, limit) : "No socket output", r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -904,7 +939,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const output = r.stdout + r.stderr;
 				return textResult(output.trim().length ? truncateText(output) : "No df output", r.code !== 0 && output.trim().length === 0);
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -935,7 +970,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				}
 				return textResult(truncateRowsWithHeader(r.stdout, limit, "containers"));
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -968,7 +1003,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 					return textResult(`docker inspect JSON output was unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, true);
 				}
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -999,7 +1034,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 					return textResult(`docker stats JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, true);
 				}
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -1030,7 +1065,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 				const output = r.stdout + r.stderr;
 				return textResult(output.trim().length ? truncateText(output, 500) : "No DNS answer", r.code !== 0);
 			} catch (err) {
-				return textResult(err instanceof Error ? err.message : String(err), true);
+				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
@@ -1138,6 +1173,7 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 
 		if (!state.active) return;
 		if (state.fatal) return { block: true, reason: `SSH Read-only Mode startup failed: ${state.reason}` };
+		if (event.toolName === SSHRO_CONNECT_TOOL) return;
 		if (!ACTIVE_SSHRO_TOOL_NAMES.includes(event.toolName as (typeof ACTIVE_SSHRO_TOOL_NAMES)[number])) {
 			return { block: true, reason: `SSH Read-only Mode allows only: ${ACTIVE_SSHRO_TOOL_NAMES.join(", ")}` };
 		}

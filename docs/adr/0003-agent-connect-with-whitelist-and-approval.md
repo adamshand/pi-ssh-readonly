@@ -10,4 +10,10 @@ Whitelist matching intentionally compares the literal target string passed to `s
 
 The `sshro_connect` tool hint includes the configured whitelist target strings, truncated after 20 entries, so the agent can prefer auto-approved targets instead of guessing and triggering unnecessary approval prompts. The hint explicitly says that automatic approval requires using the target exactly as listed. If no targets are configured, the hint says the whitelist has no configured targets.
 
-Once SSH Read-only Mode is active, `sshro_connect` is removed from the active tool set. The active agent tool surface becomes the curated read-only diagnostic tools plus `sshro_disconnect`, which lets the agent leave SSH Read-only Mode without human approval. The existing tool gate continues to block all other tool calls.
+Once SSH Read-only Mode is active, the active agent tool surface becomes the curated read-only diagnostic tools plus `sshro_disconnect`, which lets the agent leave SSH Read-only Mode without human approval. A successful `sshro_connect` result explicitly says the connection is active and tells the agent not to call `sshro_connect` again while connected.
+
+Because non-whitelisted approval can happen long after the model produced the original tool call, the model may continue with a stale pre-connection tool schema. To avoid repeated `sshro_connect` loops, successful and already-active `sshro_connect` results terminate the stale turn and queue a follow-up message so the next turn starts with the updated `sshro_*` tool set.
+
+If a stale `sshro_connect` call still reaches the extension while SSH Read-only Mode is active, the tool returns a non-error "already connected" message with the active target and remote cwd instead of a generic tool-gate error. If `sshro_*` inspection tools or `sshro_disconnect` are called while disconnected, they return clear reconnect guidance.
+
+The existing tool gate continues to block all other tool calls.
