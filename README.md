@@ -4,11 +4,11 @@
 
 I sometimes work with legacy servers where configuration has been managed by hand for years. Agent assistance on these servers is extremely valuable.  However the risk of an agent making an undetected change to a production server isn't acceptable.
 
-When SSH Read-only Mode is active, this extension disables all built in tools and adds a new set of read only tools.  The current read-only tool set is:
+This extension adds stateless read-only SSH tools alongside pi's normal local tools. Every `sshro_*` call requires an explicit SSH `target`, so agents can inspect a server and then immediately read/edit local project files without entering a modal remote-only state. The current read-only tool set is:
 
 - sshro_read
 - sshro_ls
-- sshro_find
+- sshro_locate
 - sshro_grep
 - sshro_journalctl
 - sshro_systemctl
@@ -20,7 +20,7 @@ When SSH Read-only Mode is active, this extension disables all built in tools an
 - sshro_docker_stats
 - sshro_dig
 
-Outside SSH Read-only Mode, the agent can also call `sshro_connect` to request a connection. Targets in `SSHRO_HOST_WHITELIST` auto-connect; other targets require explicit human approval. While SSH Read-only Mode is active, the agent can call `sshro_disconnect` to leave the mode without approval.
+Targets in `SSHRO_HOST_WHITELIST` are approved automatically. Other exact target strings require explicit human approval on first use and are remembered for the rest of the Pi session.
 
 It redacts and filters obvious password/secret risks, but doesn't try and catch everything (eg. passwords in `ps` output).  If this is critical in your environment you may want to make changes.
 
@@ -34,63 +34,63 @@ pi install git:git@github.com:adamshand/pi-ssh-readonly
 
 ## Usage
 
-Enter SSH Read-only Mode during an existing pi session:
+Use the tools by passing a target on each call, for example:
+
+```text
+sshro_read({ target: "adam@server", path: "/etc/nginx/nginx.conf" })
+sshro_ls({ target: "adam@server", path: "/etc", recursive: true })
+sshro_locate({ target: "adam@server", pattern: "nginx" })
+```
+
+You can pre-approve a target during an existing pi session:
 
 ```text
 /sshro adam@server
 ```
 
-Leave SSH Read-only Mode and restore the previous active tools:
+Clear session approvals:
 
 ```text
 /sshro logout
 ```
 
-The agent can also leave SSH Read-only Mode by calling `sshro_disconnect`; this does not require human approval. If the agent calls `sshro_disconnect` when SSH Read-only Mode is not connected, the tool returns a clear "not connected" message with reconnect guidance.
-
-You can also start pi directly in SSH Read-only Mode:
+You can also start pi with a pre-approved target:
 
 ```bash
 pi --ssh-ro adam@server
 ```
 
-The agent can request SSH Read-only Mode by calling `sshro_connect` with a target. If the target is listed in `SSHRO_HOST_WHITELIST`, the extension connects immediately. Otherwise, pi prompts the human to approve or deny the connection. In non-interactive modes, non-whitelisted agent connection requests fail closed because approval is not possible.
+Connection approval is exact-target based:
 
-Connection approval is only for agent-initiated `sshro_connect` calls:
-
-- Human-initiated `/sshro <target>` and `pi --ssh-ro <target>` do not consult the whitelist.
-- Whitelist matches use the exact target string passed to `sshro_connect`; `binney` and `adam@binney` are different entries.
-- After connection, the agent gets the read-only `sshro_*` tools plus `sshro_disconnect`.
-- If an agent retries `sshro_connect` after connection, the tool returns a clear "already connected" message instead of prompting again.
-- If an agent tries an `sshro_*` inspection tool while disconnected, the tool returns a clear "not connected" message explaining that it should call `sshro_connect` first.
+- Whitelist matches use the exact target string passed to each `sshro_*` tool; `binney` and `adam@binney` are different entries.
+- Non-whitelisted targets prompt on first use, then remain approved for the rest of the Pi session.
+- Human-initiated `/sshro <target>` and `pi --ssh-ro <target>` pre-approve that exact target without consulting the whitelist.
 
 **Requires passwordless SSH and an existing known_hosts entry. It will not prompt for a password or accept unknown hosts.**
 
-Paths are remote paths. Relative paths resolve from the remote login directory reported at startup. `~` is not expanded; use absolute paths like `/home/adam/...` or relative paths from the remote working directory.
+Paths are remote paths. Relative paths resolve from the SSH login directory for that tool call. `~` is not expanded; use absolute paths like `/home/adam/...` or relative paths from the remote login directory.
 
-Outside SSH Read-only Mode, you can run a local shell command and automatically feed it back to the agent by using the `!` command, eg.
+You can run a local shell command and automatically feed it back to the agent by using the `!` command, eg.
 
 ```bash
 ! echo 'the agent can see this'
 ```
 
-Whenever this extension is loaded, agent-initiated `bash` tool calls are blocked from invoking common SSH client commands or SSH transport URLs, even outside SSH Read-only Mode. The agent should use `sshro_connect` to request a connection instead. User-run `!` and `!!` commands are not blocked by this guard.
-
-While SSH Read-only Mode is active, `!` and `!!` run on the SSH target from the remote working directory. `!` feeds output back to the agent; `!!` shows output only to you. Remote command output ends with an `[ssh-ro: target:remoteCwd]` footer so the execution host and working directory are visible. The read-only guarantee applies to agent tools, not arbitrary commands you choose to run with `!`/`!!`.
+Whenever this extension is loaded, agent-initiated `bash` tool calls are blocked from invoking common SSH client commands or SSH transport URLs. The agent should use the `sshro_*` tools instead. User-run `!` and `!!` commands are not blocked by this guard.
 
 ## Configuration
 
-The extension uses OpenSSH with `BatchMode=yes` and `StrictHostKeyChecking=yes`, so authentication and host verification must already be configured before entering SSH Read-only Mode.
+The extension uses OpenSSH with `BatchMode=yes` and `StrictHostKeyChecking=yes`, so authentication and host verification must already be configured before using the `sshro_*` tools.
 
-`SSHRO_HOST_WHITELIST` is an auto-connect approval list for agent-initiated `sshro_connect` calls. Set it in the environment before starting pi:
+`SSHRO_HOST_WHITELIST` is an automatic approval list for agent-initiated `sshro_*` tool calls. Set it in the environment before starting pi:
 
 ```bash
 SSHRO_HOST_WHITELIST="web1,adam@legacy,prod-readonly" pi
 ```
 
-It is not an access-control denylist: non-whitelisted targets can still be connected to after explicit human approval. Values are comma-separated, trimmed, and matched exactly against the target string the agent passes; OpenSSH still resolves aliases, ProxyJump, identities, and other SSH config normally when the connection is made.
+It is not an access-control denylist: non-whitelisted targets can still be used after explicit human approval. Values are comma-separated, trimmed, and matched exactly against the target string the agent passes; OpenSSH still resolves aliases, ProxyJump, identities, and other SSH config normally when the tool runs.
 
-The configured target strings are included in the `sshro_connect` tool hint so the agent knows which targets can be used without prompting. The hint explicitly says that automatic approval requires using the target exactly as listed, so a whitelist entry like `binney` does not imply `adam@binney`. If more than 20 targets are configured, the hint shows the first 20 and reports how many more are present.
+The configured target strings are included in every `sshro_*` tool hint so the agent knows which targets can be used without prompting. The hint explicitly says that automatic approval requires using the target exactly as listed, so a whitelist entry like `binney` does not imply `adam@binney`. If more than 20 targets are configured, the hint shows the first 20 and reports how many more are present.
 
 Not required but configuring SSH to use connection sharing will speed things up.
 
@@ -102,11 +102,27 @@ Host *
   ControlPersist 900
 ```
 
-`index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. .env, shell history files, SSH/cloud credential directories, password-manager data, chezmoi data). Listings and find results still show blocked entries with a compact `[blocked]` marker so the agent knows they exist and can ask for help if needed. `sshro_find` does not descend into blocked directories, so parent searches may not enumerate blocked children. Recursive `sshro_find`/`sshro_grep` summarize permission errors by default so errors do not consume match budget; use `showErrors=true` for details. `sshro_grep` uses extended regex (`grep -E`) by default; use `literal=true` for fixed-string search. If you have specific requirements edit this.
+`index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. .env, shell history files, SSH/cloud credential directories, password-manager data, chezmoi data). Listings still show blocked entries with a compact `[blocked]` marker where possible so the agent knows they exist and can ask for help if needed. Recursive `sshro_grep` excludes blocked credential/history/password-manager paths. `sshro_grep` uses extended regex (`grep -E`) by default; use `literal=true` for fixed-string search. If you have specific requirements edit this.
 
-`sshro_read` supports negative `offset` values for efficient tail-style reads of large files, e.g. `offset=-100` reads the last 100 lines using remote `tail`.
+`sshro_ls` supports `recursive=true` for live recursive listings. Recursive listing uses `eza -1l --absolute=on -R --color=never --icons=never` when available, filters eza grouping headers, and falls back to `ls -laR` otherwise.
 
-Docker tools are optional and checked when the tool runs, not at startup. `sshro_docker_ps` returns compact `docker ps --no-trunc` table output, defaults to active containers only, and reports `No active Docker containers` when only the header is returned. Use `all=true` to include stopped/exited containers. `sshro_docker_stats` returns parsed JSON using Docker's native field names and rejects `limit` values below 1. If output is row-limited, Docker row tools append an `[ssh-ro output truncated ...]` note. `sshro_docker_inspect` returns Docker-shaped JSON with targeted redaction: environment variables are visibly redacted, sensitive-looking label values are redacted, and image `GraphDriver.Data` is omitted. Docker command strings, mountpoints, and network topology may be visible. `sshro_docker_stats` always uses one-shot `--no-stream` mode; call it multiple times a few seconds apart to compare noisy CPU readings.
+`sshro_locate` uses `plocate` for very fast indexed path search. Results may be stale depending on how often the server updates its locate database.
+
+Some tools can use elevated read-only access when sudoers allows the exact fixed command. Before running any elevated command the extension checks `sudo -n -l <command ...>`; if sudo requires a password or the command is not allowed, the tool falls back to the non-sudo command and reports that elevated access was unavailable. This avoids noisy failed sudo command attempts. Example sudoers additions for a trusted account on servers you control:
+
+```sudoers
+agent ALL=(root) NOPASSWD: /usr/bin/cat *
+agent ALL=(root) NOPASSWD: /usr/bin/ls *
+agent ALL=(root) NOPASSWD: /usr/bin/grep *
+agent ALL=(root) NOPASSWD: /usr/bin/eza -1l --absolute=on -R --color=never --icons=never -- *
+agent ALL=(root) NOPASSWD: /usr/bin/plocate *
+```
+
+Avoid broad rules such as `NOPASSWD: ALL`, `/usr/bin/find *`, or shell access.
+
+`sshro_read` supports negative `offset` values for efficient tail-style reads of large files, e.g. `offset=-100` reads the last 100 lines.
+
+Docker tools are optional and checked when the tool runs, not at startup. `sshro_docker_ps` returns compact `docker ps --no-trunc` table output, defaults to active containers only, and reports `No active Docker containers` when only the header is returned. Use `all=true` to include stopped/exited containers. `sshro_docker_stats` returns parsed JSON using Docker's native field names and rejects `limit` values below 1. If output is row-limited, Docker row tools append an `[ssh-ro output truncated ...]` note. `sshro_docker_inspect` uses `target` for the SSH target and `object` for the Docker object name/ID, and returns Docker-shaped JSON with targeted redaction: environment variables are visibly redacted, sensitive-looking label values are redacted, and image `GraphDriver.Data` is omitted. Docker command strings, mountpoints, and network topology may be visible. `sshro_docker_stats` always uses one-shot `--no-stream` mode; call it multiple times a few seconds apart to compare noisy CPU readings.
 
 `sshro_dig` runs bounded DNS lookups from the remote host using `dig +time=3 +tries=1`. `dig` is checked when the tool runs and returns a clear error if missing.
 
@@ -119,7 +135,6 @@ Docker tools are optional and checked when the tool runs, not at startup. `sshro
 
 - Investigate sandboxing all tools inside `systemd-run` to provide a layer of protection in case of bugs in the tools.
 - Give the agent a way to perform web searches.
-- Give the agent the ability to read files it doesn't have permissions for.
 - Consider `sshro_ps` argument redaction for obvious secret patterns and/or clearer guidance that process command lines can disclose secrets.
-- Consider optional pruning/avoidance for network shares during broad recursive `find`/`grep` scans if this becomes a real problem on target servers.
+- Consider optional pruning/avoidance for network shares during broad recursive listings/grep scans if this becomes a real problem on target servers.
 - Consider read-only HTTP healthcheck tooling, possibly with an approval step because it performs outbound requests from the remote host.

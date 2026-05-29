@@ -1,20 +1,9 @@
 import { spawn } from "node:child_process";
-import type { BashOperations, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createLsTool } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import Type from "typebox";
 
-type SshRoState =
-	| { active: false; fatal?: undefined }
-	| { active: true; target: string; remoteCwd: string; fatal: false }
-	| { active: true; target: string; remoteCwd?: string; fatal: true; reason: string };
-
-const SSHRO_CONNECT_TOOL = "sshro_connect";
-const SSHRO_DISCONNECT_TOOL = "sshro_disconnect";
 const SSHRO_HOST_WHITELIST_ENV = "SSHRO_HOST_WHITELIST";
-const TOOL_NAMES = ["sshro_read", "sshro_ls", "sshro_find", "sshro_grep", "sshro_journalctl", "sshro_systemctl", "sshro_ps", "sshro_ss", "sshro_df", "sshro_docker_ps", "sshro_docker_inspect", "sshro_docker_stats", "sshro_dig"] as const;
-const ACTIVE_SSHRO_TOOL_NAMES = [...TOOL_NAMES, SSHRO_DISCONNECT_TOOL] as const;
-const REQUIRED_REMOTE_COMMANDS = ["file", "find", "grep", "head", "sed", "stat", "tail", "ls"];
 const DEFAULT_LINE_LIMIT = 2000;
 const DEFAULT_BYTE_LIMIT = 50 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -37,11 +26,10 @@ const SHELL_C_SSH_RE = new RegExp(
 const SSH_TRANSPORT_RE = /\b(?:ssh|sftp|scp):\/\/|\bgit@[-A-Za-z0-9_.]+:/i;
 const SSH_ENV_RE = /\b(?:GIT_SSH|GIT_SSH_COMMAND|RSYNC_RSH)\s*=/i;
 
-let state: SshRoState = { active: false };
 let toolsRegistered = false;
-let connectToolRegistered = false;
-let connectInProgressTarget: string | undefined;
-let previousActiveTools: string[] | undefined;
+const approvedTargets = new Set<string>();
+const remoteCommandCache = new Map<string, string | undefined>();
+const sudoCheckCache = new Map<string, { allowed: boolean; reason: string }>();
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -80,7 +68,7 @@ function validatePathLike(value: string, label: string): void {
 }
 
 function bashSshBlockReason(command: string): string | undefined {
-	if (SSH_COMMAND_RE.test(command) || SHELL_C_SSH_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from invoking SSH client commands. Use sshro_connect, sshro_* tools, or user-run ! commands instead.";
+	if (SSH_COMMAND_RE.test(command) || SHELL_C_SSH_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from invoking SSH client commands. Use the stateless sshro_* tools with an explicit target, or user-run ! commands instead.";
 	if (SSH_TRANSPORT_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from using SSH transport URLs.";
 	if (SSH_ENV_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from configuring SSH transport environment variables.";
 	return undefined;
@@ -213,53 +201,6 @@ function sshExec(target: string, command: string, signal?: AbortSignal, timeoutM
 	});
 }
 
-function sshBashOperations(target: string, remoteCwd: string): BashOperations {
-	return {
-		exec(command, _cwd, { onData, signal, timeout }) {
-			return new Promise((resolve, reject) => {
-				const child = spawnSsh(target, `cd ${shellQuote(remoteCwd)} && ${command}`);
-				let timedOut = false;
-				let timer: ReturnType<typeof setTimeout> | undefined;
-				let sawOutput = false;
-				let endedWithNewline = true;
-				if (timeout !== undefined && timeout > 0) {
-					timer = setTimeout(() => {
-						timedOut = true;
-						child.kill("SIGTERM");
-					}, timeout * 1000);
-				}
-				const cleanup = () => {
-					if (timer) clearTimeout(timer);
-					signal?.removeEventListener("abort", onAbort);
-				};
-				const emit = (d: Buffer) => {
-					sawOutput = true;
-					endedWithNewline = d.length === 0 || d[d.length - 1] === 10;
-					onData(d);
-				};
-				const onAbort = () => child.kill("SIGTERM");
-				signal?.addEventListener("abort", onAbort, { once: true });
-				child.stdout.on("data", (d) => emit(Buffer.from(d)));
-				child.stderr.on("data", (d) => emit(Buffer.from(d)));
-				child.on("error", (err) => {
-					cleanup();
-					reject(err);
-				});
-				child.on("close", (code) => {
-					cleanup();
-
-					const spacer = sawOutput ? (endedWithNewline ? "\n" : "\n\n") : "";
-					onData(Buffer.from(`${spacer}[ssh-ro: ${target}:${remoteCwd}]\n`));
-
-					if (signal?.aborted) reject(new Error("aborted"));
-					else if (timedOut) reject(new Error(`timeout:${timeout}`));
-					else resolve({ exitCode: code });
-				});
-			});
-		},
-	};
-}
-
 async function sshChecked(target: string, command: string, signal?: AbortSignal, timeoutMs?: number): Promise<string> {
 	const r = await sshExec(target, command, signal, timeoutMs);
 	if (r.code !== 0) {
@@ -268,36 +209,80 @@ async function sshChecked(target: string, command: string, signal?: AbortSignal,
 	return r.stdout;
 }
 
+function targetParam() {
+	return Type.String({ description: `SSH target to connect to, e.g. user@host or an OpenSSH Host alias. Must match whitelist entries exactly for automatic approval. ${whitelistedHostsPromptHint()}` });
+}
+
+async function authorizeTarget(target: string, ctx: ExtensionContext, signal?: AbortSignal): Promise<string> {
+	const trimmed = target.trim();
+	validateTarget(trimmed);
+	if (isWhitelistedHost(trimmed) || approvedTargets.has(trimmed)) return trimmed;
+	if (!ctx.hasUI) throw new Error(`SSH read-only tool call to ${trimmed} requires human approval because it is not in ${SSHRO_HOST_WHITELIST_ENV}, but no UI is available.`);
+	const approved = await ctx.ui.confirm(
+		"Approve SSH read-only tool access?",
+		`The agent wants to run read-only SSH inspection tools against:\n\n${trimmed}\n\nApproval is remembered for this Pi session only and matches this exact target string.`,
+		{ signal },
+	);
+	if (!approved) throw new Error(`SSH read-only tool access to ${trimmed} was denied by the human.`);
+	approvedTargets.add(trimmed);
+	return trimmed;
+}
+
+async function resolveRemoteCommand(target: string, command: string, signal?: AbortSignal): Promise<string | undefined> {
+	const key = `${target}\0${command}`;
+	if (remoteCommandCache.has(key)) return remoteCommandCache.get(key);
+	const r = await sshExec(target, `command -v ${shellQuote(command)} 2>/dev/null || true`, signal, 10_000);
+	const resolved = r.stdout.trim().split(/\r?\n/).find(Boolean);
+	remoteCommandCache.set(key, resolved);
+	return resolved;
+}
+
+function commandString(commandPath: string, args: string[]): string {
+	return [commandPath, ...args].map(shellQuote).join(" ");
+}
+
+function sudoSetupHint(commandPath: string, argsHint = "*"): string {
+	return `If elevated access was expected, configure a NOPASSWD sudoers rule for this SSH user, e.g.:\n\n  <user> ALL=(root) NOPASSWD: ${commandPath} ${argsHint}\n\nNo elevated command is run unless sudo -n -l confirms it first.`;
+}
+
+async function checkSudoAllowed(target: string, commandPath: string, args: string[], signal?: AbortSignal): Promise<{ allowed: boolean; reason: string }> {
+	const key = `${target}\0${commandPath}\0${args.join("\0")}`;
+	const cached = sudoCheckCache.get(key);
+	if (cached) return cached;
+	const r = await sshExec(target, `sudo -n -l ${commandString(commandPath, args)} >/dev/null`, signal, 10_000);
+	const result = { allowed: r.code === 0, reason: (r.stderr || r.stdout).trim() };
+	sudoCheckCache.set(key, result);
+	return result;
+}
+
+async function chooseCommand(target: string, command: string, args: string[], signal?: AbortSignal): Promise<{ commandPath: string; command: string; usedSudo: boolean; sudoReason: string }> {
+	const commandPath = await resolveRemoteCommand(target, command, signal);
+	if (!commandPath) throw new Error(`${command} not found on remote host`);
+	const sudo = await checkSudoAllowed(target, commandPath, args, signal);
+	const base = commandString(commandPath, args);
+	return { commandPath, command: sudo.allowed ? `sudo -n ${base}` : base, usedSudo: sudo.allowed, sudoReason: sudo.reason };
+}
+
+function sudoNote(usedSudo: boolean, sudoReason: string): string {
+	if (usedSudo) return "[ssh-ro note] Used sudo: yes";
+	if (/password is required|a terminal is required|no tty/i.test(sudoReason)) return "[ssh-ro note] Used sudo: no; sudo requires a password/tty for this command.";
+	return "[ssh-ro note] Used sudo: no; sudo permission was not available for this command.";
+}
+
+function appendSudoNote(output: string, usedSudo: boolean, sudoReason: string): string {
+	return `${output.trimEnd()}\n\n${sudoNote(usedSudo, sudoReason)}`;
+}
+
+function permissionDenied(text: string): boolean {
+	return /permission denied|operation not permitted/i.test(text);
+}
+
 function textResult(text: string, isError = false) {
 	return { content: [{ type: "text" as const, text }], isError };
 }
 
 function errorResult(err: unknown) {
-	const message = err instanceof Error ? err.message : String(err);
-	const result = textResult(message, true);
-	return message.includes("SSH Read-only Mode is not connected right now") ? { ...result, terminate: true } : result;
-}
-
-function sshRoConnectActiveMessage(target: string, remoteCwd: string, suffix: string): string {
-	return `SSH Read-only Mode active for ${target}${suffix}.\nRemote cwd: ${remoteCwd}\n\nYou are connected now. Use these tools for remote inspection: ${ACTIVE_SSHRO_TOOL_NAMES.join(", ")}. Do not call ${SSHRO_CONNECT_TOOL} again while SSH Read-only Mode is active; use ${SSHRO_DISCONNECT_TOOL} to leave.`;
-}
-
-function sshRoConnectAlreadyActiveMessage(requestedTarget: string, activeTarget: string, remoteCwd: string): string {
-	const requested = requestedTarget === activeTarget ? "" : ` The requested target was ${requestedTarget}; no new connection was attempted.`;
-	return `Already in SSH Read-only Mode for ${activeTarget}.${requested}\nRemote cwd: ${remoteCwd}\n\nContinue with the sshro_* read-only tools. Do not call ${SSHRO_CONNECT_TOOL} again while SSH Read-only Mode is active; use ${SSHRO_DISCONNECT_TOOL} to leave.`;
-}
-
-function sshRoInactiveMessage(prefix = "SSH Read-only Mode is not connected right now."): string {
-	return `${prefix}\n\nTo inspect a remote server, call ${SSHRO_CONNECT_TOOL} with an SSH target. For automatic approval, use a whitelist target exactly as listed. If you do not know which target to use, ask the user.\n\n${whitelistedHostsPromptHint()}`;
-}
-
-function queueSshRoReadyFollowUp(pi: ExtensionAPI, target: string, remoteCwd: string): void {
-	pi.sendMessage({
-		customType: "ssh-ro-ready",
-		content: `SSH Read-only Mode is active for ${target}.\nRemote cwd: ${remoteCwd}\n\nThe tool set has changed. Continue the user's previous request using the active sshro_* read-only tools. Do not call ${SSHRO_CONNECT_TOOL} again while SSH Read-only Mode is active; use ${SSHRO_DISCONNECT_TOOL} only when remote inspection is complete or the user asks to leave SSH Read-only Mode.`,
-		display: false,
-		details: { target, remoteCwd, tools: ACTIVE_SSHRO_TOOL_NAMES },
-	}, { deliverAs: "followUp", triggerTurn: true });
+	return textResult(err instanceof Error ? err.message : String(err), true);
 }
 
 function optionalString(value: unknown): string | undefined {
@@ -460,135 +445,29 @@ function curateDockerInspect(items: unknown[]): unknown {
 	return items.map(redactDockerEnvs);
 }
 
-function sshRoModeNote(target: string, remoteCwd: string): string {
-	return `SSH Read-only Mode active: ${target}\nRemote cwd: ${remoteCwd}\n\nAvailable tools:\n${ACTIVE_SSHRO_TOOL_NAMES.join(", ")}\n\nPath notes:\n- Paths are remote paths; relative paths resolve from the remote cwd.\n- ~ is not expanded; use absolute paths like /home/name/... or relative paths from the remote cwd.\n- [blocked] means credential/history/password-manager content is blocked; ask the user to inspect manually if needed.\n- sshro_find shows matching blocked entries but does not descend into blocked directories, so parent searches may not enumerate blocked children.\n- sshro_df defaults to local filesystems only to reduce risk from slow network mounts.
-- Docker tools are optional fixed read-only inspections. sshro_docker_ps returns compact Docker table output by default; sshro_docker_inspect returns curated JSON and visibly redacts environment variables because Docker metadata can contain secrets.
-- sshro_read supports negative offset values to read from the end of large files using tail.
-- sshro_dig performs fixed, bounded DNS lookups with dig when available on the remote host.
-- SSH Read-only Mode is already connected; use the listed sshro_* tools and do not call sshro_connect again unless after sshro_disconnect.
-- User ! and !! commands run on the SSH target while SSH Read-only Mode is active; !! still excludes output from model context. Remote command output ends with an [ssh-ro: target:remoteCwd] footer.`;
-}
-
-function requireHealthy(): { target: string; remoteCwd: string } {
-	if (!state.active) throw new Error(sshRoInactiveMessage());
-	if (state.fatal) throw new Error(`SSH Read-only Mode startup failed: ${state.reason}`);
-	return { target: state.target, remoteCwd: state.remoteCwd };
-}
-
-async function startupCheck(target: string): Promise<string> {
-	const script = [
-		"printf '%s\\n' __PI_SSHRO_PWD_START__",
-		"pwd",
-		"printf '%s\\n' __PI_SSHRO_PWD_END__",
-		"printf '%s\\n' __PI_SSHRO_CHECKS_START__",
-		`for c in ${REQUIRED_REMOTE_COMMANDS.map(shellQuote).join(" ")}; do command -v "$c" >/dev/null 2>&1 || echo "MISSING:$c"; done`,
-		"printf '%s\\n' __PI_SSHRO_CHECKS_END__",
-	].join("; ");
-	const out = await sshChecked(target, script, undefined, 15_000);
-	const lines = out.trim().split(/\r?\n/);
-	const pwdStart = lines.indexOf("__PI_SSHRO_PWD_START__");
-	const pwdEnd = lines.indexOf("__PI_SSHRO_PWD_END__");
-	const checksStart = lines.indexOf("__PI_SSHRO_CHECKS_START__");
-	const checksEnd = lines.indexOf("__PI_SSHRO_CHECKS_END__");
-	if (pwdStart === -1 || pwdEnd === -1 || pwdEnd <= pwdStart) {
-		throw new Error(`could not find startup check markers in SSH output: ${out.trim()}`);
-	}
-	const cwd = lines.slice(pwdStart + 1, pwdEnd).find((l) => l.startsWith("/"));
-	if (!cwd) throw new Error(`could not resolve remote working directory from pwd output: ${out.trim()}`);
-	const checkLines = checksStart !== -1 && checksEnd !== -1 && checksEnd > checksStart ? lines.slice(checksStart + 1, checksEnd) : lines;
-	const missing = checkLines.filter((l) => l.startsWith("MISSING:")).map((l) => l.slice("MISSING:".length));
-	if (missing.length > 0) throw new Error(`remote host is missing required commands: ${missing.join(", ")}`);
-	return cwd;
-}
-
-function registerSshRoConnectTool(pi: ExtensionAPI): void {
-	if (connectToolRegistered) return;
-	connectToolRegistered = true;
-	const whitelistHint = whitelistedHostsPromptHint();
-	pi.registerTool({
-		name: SSHRO_CONNECT_TOOL,
-		label: SSHRO_CONNECT_TOOL,
-		description: `Connect to a server via SSH Read-only Mode. ${whitelistHint}`,
-		promptSnippet: `sshro_connect: Connect to a server via SSH Read-only Mode. ${whitelistHint}`,
-		parameters: Type.Object({
-			target: Type.String({ description: "SSH target to connect to, e.g. user@host or an OpenSSH Host alias" }),
-		}),
-		executionMode: "parallel",
-		async execute(_id, params, signal, _onUpdate, ctx) {
-			const target = params.target.trim();
-			try {
-				validateTarget(target);
-				if (state.active && !state.fatal) {
-					queueSshRoReadyFollowUp(pi, state.target, state.remoteCwd);
-					return { ...textResult(sshRoConnectAlreadyActiveMessage(target, state.target, state.remoteCwd)), terminate: true };
-				}
-				if (connectInProgressTarget) {
-					return textResult(`SSH Read-only connection already in progress for ${connectInProgressTarget}`, true);
-				}
-				connectInProgressTarget = target;
-				const whitelisted = isWhitelistedHost(target);
-				if (!whitelisted) {
-					if (!ctx.hasUI) {
-						return textResult(`SSH Read-only connection to ${target} requires human approval because it is not in ${SSHRO_HOST_WHITELIST_ENV}, but no UI is available.`, true);
-					}
-					const approved = await ctx.ui.confirm(
-						"Approve SSH Read-only connection?",
-						`The agent wants to enter SSH Read-only Mode for:\n\n${target}\n\nOnly the curated sshro_* read-only diagnostic tools will be active after connection.`,
-						{ signal },
-					);
-					if (!approved) return textResult(`SSH Read-only connection to ${target} was denied by the human.`);
-				}
-				await activateSshRo(pi, ctx, target);
-				const remoteCwd = state.active && !state.fatal ? state.remoteCwd : "<unknown>";
-				queueSshRoReadyFollowUp(pi, target, remoteCwd);
-				return { ...textResult(sshRoConnectActiveMessage(target, remoteCwd, whitelisted ? ` via ${SSHRO_HOST_WHITELIST_ENV}` : " after human approval")), terminate: true };
-			} catch (err) {
-				return errorResult(err);
-			} finally {
-				connectInProgressTarget = undefined;
-			}
-		},
-		renderCall(args, theme) {
-			return new Text(`${theme.fg("toolTitle", theme.bold(SSHRO_CONNECT_TOOL))} ${theme.fg("accent", args.target ?? "...")}`, 0, 0);
-		},
-	});
-}
 
 function registerSshRoTools(pi: ExtensionAPI): void {
 	if (toolsRegistered) return;
 	toolsRegistered = true;
-	pi.registerTool({
-		name: SSHRO_DISCONNECT_TOOL,
-		label: SSHRO_DISCONNECT_TOOL,
-		description: "End SSH Read-only Mode and restore the previous active tool set. Does not require human approval.",
-		promptSnippet: "sshro_disconnect: End SSH Read-only Mode and restore the previous active tool set. Use when remote inspection is complete or the user asks to leave SSH Read-only Mode.",
-		parameters: Type.Object({}),
-		executionMode: "parallel",
-		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			if (!state.active) return { ...textResult(sshRoInactiveMessage("SSH Read-only Mode is not connected right now, so there is nothing to disconnect.")), terminate: true };
-			const target = state.target;
-			deactivateSshRo(pi, ctx);
-			return { ...textResult(`SSH Read-only Mode ended for ${target}. To inspect a remote server again, call ${SSHRO_CONNECT_TOOL} with a target.`), terminate: true };
-		},
-		renderCall(_args, theme) {
-			return new Text(theme.fg("toolTitle", theme.bold(SSHRO_DISCONNECT_TOOL)), 0, 0);
-		},
-	});
-	const cwd = process.cwd();
 	const readParams = Type.Object({
-		path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
+		target: targetParam(),
+		path: Type.String({ description: "Path to the file to read on the SSH target (relative to the remote login cwd, or absolute)" }),
 		offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed). Use a negative value to read from the end of the file, e.g. -100 for the last 100 lines." })),
 		limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
 	});
-	const lsParams = createLsTool(cwd).parameters;
-	const findParams = Type.Object({
-		path: Type.Optional(Type.String({ description: "Directory path to search from, default remote cwd" })),
-		pattern: Type.String({ description: "File name/path glob. Patterns without '/' match names; patterns with '/' match paths." }),
+	const lsParams = Type.Object({
+		target: targetParam(),
+		path: Type.Optional(Type.String({ description: "Remote path to list, default remote login cwd" })),
+		recursive: Type.Optional(Type.Boolean({ description: "Recursively list descendants. Uses eza when available and falls back to ls -laR." })),
+		limit: Type.Optional(Type.Number({ description: "Maximum output lines, default 500, max 2000" })),
+	});
+	const locateParams = Type.Object({
+		target: targetParam(),
+		pattern: Type.String({ description: "plocate search pattern. Results come from the locate database and may be stale." }),
 		limit: Type.Optional(Type.Number({ description: "Maximum matches returned, default 500, max 2000" })),
-		showErrors: Type.Optional(Type.Boolean({ description: "Include detailed search errors, default false. Permission errors are summarized either way." })),
-		errorLimit: Type.Optional(Type.Number({ description: "Maximum detailed error lines when showErrors=true, default 20, max 2000" })),
 	});
 	const grepParams = Type.Object({
+		target: targetParam(),
 		path: Type.String({ description: "File or directory path to search" }),
 		pattern: Type.String({ description: "Extended regular expression to search for by default; use literal=true for fixed-string search" }),
 		glob: Type.Optional(Type.String({ description: "Optional filename glob for recursive directory search, e.g. *.log" })),
@@ -600,6 +479,7 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		errorLimit: Type.Optional(Type.Number({ description: "Maximum detailed error lines when showErrors=true, default 20, max 2000" })),
 	});
 	const journalctlParams = Type.Object({
+		target: targetParam(),
 		unit: Type.Optional(Type.String({ description: "systemd unit to filter, e.g. nginx.service" })),
 		since: Type.Optional(Type.String({ description: "journalctl --since value, e.g. '1 hour ago'" })),
 		until: Type.Optional(Type.String({ description: "journalctl --until value" })),
@@ -608,16 +488,19 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		lines: Type.Optional(Type.Number({ description: "Maximum recent journal lines, default 200, max 2000" })),
 	});
 	const systemctlParams = Type.Object({
+		target: targetParam(),
 		action: Type.Union([Type.Literal("failed"), Type.Literal("status"), Type.Literal("show"), Type.Literal("list")]),
 		unit: Type.Optional(Type.String({ description: "Unit name for status/show, e.g. nginx.service" })),
 	});
 	const psParams = Type.Object({
+		target: targetParam(),
 		user: Type.Optional(Type.String({ description: "Filter to this process owner" })),
 		pattern: Type.Optional(Type.String({ description: "Filter command lines with grep -i" })),
 		sort: Type.Optional(Type.Union([Type.Literal("cpu"), Type.Literal("mem"), Type.Literal("pid")])),
 		limit: Type.Optional(Type.Number({ description: "Maximum output lines, default 80, max 2000" })),
 	});
 	const ssParams = Type.Object({
+		target: targetParam(),
 		listeningOnly: Type.Optional(Type.Boolean({ description: "Show only listening sockets, default true" })),
 		tcp: Type.Optional(Type.Boolean({ description: "Include TCP sockets, default true" })),
 		udp: Type.Optional(Type.Boolean({ description: "Include UDP sockets, default true" })),
@@ -625,24 +508,29 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		limit: Type.Optional(Type.Number({ description: "Maximum output lines, default 500, max 2000" })),
 	});
 	const dfParams = Type.Object({
+		target: targetParam(),
 		path: Type.Optional(Type.String({ description: "Optional path/filesystem to inspect" })),
 		localOnly: Type.Optional(Type.Boolean({ description: "Use df -l to avoid remote/network filesystems, default true" })),
 		human: Type.Optional(Type.Boolean({ description: "Human-readable sizes, default true" })),
 	});
 	const dockerPsParams = Type.Object({
+		target: targetParam(),
 		all: Type.Optional(Type.Boolean({ description: "Include stopped containers, default false" })),
 		name: Type.Optional(Type.String({ description: "Optional Docker name filter substring/pattern" })),
 		limit: Type.Optional(Type.Number({ description: "Maximum containers returned, default 100, max 2000" })),
 	});
 	const dockerInspectParams = Type.Object({
-		target: Type.String({ description: "Docker object name or ID to inspect" }),
+		target: targetParam(),
+		object: Type.String({ description: "Docker object name or ID to inspect" }),
 		kind: Type.Optional(Type.String({ description: "Optional Docker object kind: container, image, network, or volume" })),
 	});
 	const dockerStatsParams = Type.Object({
+		target: targetParam(),
 		container: Type.Optional(Type.String({ description: "Optional container name or ID" })),
 		limit: Type.Optional(Type.Number({ description: "Maximum containers returned, default 100, max 2000" })),
 	});
 	const digParams = Type.Object({
+		target: targetParam(),
 		name: Type.String({ description: "DNS name or address to query" }),
 		type: Type.Optional(Type.Union([Type.Literal("A"), Type.Literal("AAAA"), Type.Literal("CNAME"), Type.Literal("MX"), Type.Literal("TXT"), Type.Literal("NS"), Type.Literal("SOA"), Type.Literal("PTR"), Type.Literal("CAA"), Type.Literal("SRV")], { description: "DNS record type, default A" })),
 		server: Type.Optional(Type.String({ description: "Optional DNS server, e.g. 1.1.1.1 or dns.example.com" })),
@@ -652,147 +540,180 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "sshro_read",
 		label: "sshro_read",
-		description: "Read a text file from the SSH Read-only Mode target. Supports path, offset, and limit. Negative offset reads from the end of the file. Binary/non-text files are refused.",
-		promptSnippet: "sshro_read: Read a text file from the SSH Read-only Mode target with optional line offset/limit. Use negative offset to read from the end of large logs.",
+		description: "Read a text file from an SSH target. Requires target on every call. Uses sudo only when sudo -n -l confirms the fixed cat command is allowed.",
+		promptSnippet: "sshro_read: Read a text file from an SSH target with optional line offset/limit. Requires target. May use sudo after sudo -n -l confirms access.",
 		parameters: readParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target, remoteCwd } = requireHealthy();
-				const p = remotePath(params.path, remoteCwd);
+				const target = await authorizeTarget(params.target, ctx, signal);
+				const p = remotePath(params.path, ".");
 				assertPathAllowed(p);
 				const rawOffset = params.offset === undefined ? 1 : Math.floor(Number(params.offset));
 				if (!Number.isFinite(rawOffset)) throw new Error("offset must be a number");
 				const offset = rawOffset === 0 ? 1 : rawOffset;
 				const limit = validatePositiveLimit(params.limit, "limit", DEFAULT_LINE_LIMIT);
 				const rangeLabel = offset < 0 ? `last ${Math.abs(offset)} lines${params.limit !== undefined ? `, limited to ${limit}` : ""}` : `${offset}-${offset + limit - 1}`;
-				const readCommand = offset < 0
-					? `tail -n ${Math.abs(offset)} "$p"${params.limit !== undefined ? ` | head -n ${limit}` : ""}`
+				const read = await chooseCommand(target, "cat", ["--", p], signal);
+				const slice = offset < 0
+					? `tail -n ${Math.abs(offset)}${params.limit !== undefined ? ` | head -n ${limit}` : ""}`
 					: offset === 1
-						? `head -n ${limit} "$p"`
-						: `tail -n +${offset} "$p" | head -n ${limit}`;
-				const q = shellQuote(p);
-				const script = `p=${q}; if [ ! -e "$p" ]; then echo "not found: $p" >&2; exit 2; fi; if [ ! -f "$p" ]; then echo "not a regular file: $p" >&2; exit 2; fi; if [ ! -r "$p" ]; then echo "not readable: $p" >&2; exit 2; fi; mt=$(file --mime-type -b "$p" 2>/dev/null || true); case "$mt" in text/*|inode/x-empty|application/json|application/xml|application/x-shellscript|application/x-perl|application/x-python|application/javascript|application/x-yaml) ;; *) echo "refusing non-text file ($mt): $p" >&2; exit 3;; esac; printf 'path: %s\\nmime: %s\\nlines: %s\\n---\\n' "$p" "$mt" ${shellQuote(rangeLabel)}; ${readCommand}`;
-				const out = await sshChecked(target, script, signal);
-				return textResult(truncateText(out));
+						? `head -n ${limit}`
+						: `tail -n +${offset} | head -n ${limit}`;
+				const script = `printf 'path: %s
+lines: %s
+---
+' ${shellQuote(p)} ${shellQuote(rangeLabel)}; ${read.command} | ${slice}`;
+				const r = await sshExec(target, script, signal);
+				let output = r.stdout;
+				if (r.stderr) output += `
+[stderr]
+${r.stderr}`;
+				const failed = r.code !== 0 || r.stderr.trim().length > 0;
+				if (failed && permissionDenied(output) && !read.usedSudo) output += `
+
+${sudoSetupHint(read.commandPath)}`;
+				return textResult(appendSudoNote(truncateText(output), read.usedSudo, read.sudoReason), failed);
 			} catch (err) {
 				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
-			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_read"))} ${theme.fg("accent", args.path ?? "...")}`, 0, 0);
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_read"))} ${theme.fg("accent", args.path ?? "...")} ${theme.fg("muted", args.target ?? "")}`, 0, 0);
 		},
 	});
 
 	pi.registerTool({
 		name: "sshro_ls",
 		label: "sshro_ls",
-		description: "List a remote SSH Read-only Mode path. Includes hidden files and ls -la style metadata.",
-		promptSnippet: "sshro_ls: List files on the SSH Read-only Mode target, including hidden files and metadata.",
+		description: "List a remote SSH target path. Requires target on every call. Supports recursive listings using eza when available, falling back to ls -laR.",
+		promptSnippet: "sshro_ls: List files on an SSH target. Requires target. Set recursive=true for a live recursive listing; uses eza if available and falls back to ls.",
 		parameters: lsParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target, remoteCwd } = requireHealthy();
-				const p = remotePath(params.path, remoteCwd);
+				const target = await authorizeTarget(params.target, ctx, signal);
+				const p = remotePath(params.path, ".");
 				assertPathAllowed(p);
-				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 500)));
-				const script = `p=${shellQuote(p)}; if [ -d "$p" ]; then LC_ALL=C ls -la "$p"; else LC_ALL=C ls -ld "$p"; fi`;
-				const r = await sshExec(target, script, signal);
-				const stdout = r.code === 0 ? markBlockedLsEntries(r.stdout, p) : r.stdout;
-				const combined = `${stdout}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}`;
-				return textResult(truncateText(combined, limit), r.code !== 0);
+				const limit = validatePositiveLimit(params.limit, "limit", 500);
+				const recursive = params.recursive === true;
+				const ezaPath = recursive ? await resolveRemoteCommand(target, "eza", signal) : undefined;
+				const commandName = ezaPath ? "eza" : "ls";
+				const args = ezaPath ? ["-1l", "--absolute=on", "-R", "--color=never", "--icons=never", "--", p] : [recursive ? "-laR" : "-la", "--", p];
+				const chosen = await chooseCommand(target, commandName, args, signal);
+				const filter = ezaPath ? ` | grep -Ev '^(/|$)'` : "";
+				const r = await sshExec(target, `LC_ALL=C ${chosen.command}${filter} | sed -n '1,${limit}p'`, signal, recursive ? 45_000 : 30_000);
+				const stdout = r.code === 0 && !recursive ? markBlockedLsEntries(r.stdout, p) : r.stdout;
+				let combined = `${stdout}${r.stderr ? `
+[stderr]
+${r.stderr}` : ""}`;
+				const failed = r.code !== 0 || r.stderr.trim().length > 0;
+				if (failed && permissionDenied(combined) && !chosen.usedSudo) combined += `
+
+${sudoSetupHint(chosen.commandPath, ezaPath ? "-1l --absolute=on -R --color=never --icons=never -- *" : "*")}`;
+				return textResult(appendSudoNote(truncateText(combined, limit), chosen.usedSudo, chosen.sudoReason), failed);
 			} catch (err) {
 				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
-			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_ls"))} ${theme.fg("accent", args.path ?? ".")}`, 0, 0);
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_ls"))} ${theme.fg("accent", args.path ?? ".")} ${theme.fg("muted", args.target ?? "")}`, 0, 0);
 		},
 	});
 
 	pi.registerTool({
-		name: "sshro_find",
-		label: "sshro_find",
-		description: "Find remote paths on the SSH Read-only Mode target. Patterns without '/' match names; patterns with '/' match paths. Recursive search prunes .git and node_modules unless the search path is inside one of them.",
-		promptSnippet: "sshro_find: Find paths on the SSH Read-only Mode target using POSIX find-style name/path matching.",
-		parameters: findParams,
+		name: "sshro_locate",
+		label: "sshro_locate",
+		description: "Search the remote plocate database for paths. Results are indexed and may be stale; no regex option is exposed.",
+		promptSnippet: "sshro_locate: Quickly search indexed remote paths with plocate. Requires target. Results may be stale; use sshro_ls recursive for live listings.",
+		parameters: locateParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target, remoteCwd } = requireHealthy();
+				const target = await authorizeTarget(params.target, ctx, signal);
 				validatePathLike(params.pattern, "pattern");
-				const base = remotePath(params.path, remoteCwd);
 				const limit = validatePositiveLimit(params.limit, "limit", 500);
-				const showErrors = params.showErrors === true;
-				const errorLimit = validatePositiveLimit(params.errorLimit, "errorLimit", 20);
-				const pathPattern = params.pattern.includes("/") && !params.pattern.startsWith("/") ? `*/${params.pattern}` : params.pattern;
-				const pred = params.pattern.includes("/") ? `-path ${shellQuote(pathPattern)}` : `-name ${shellQuote(params.pattern)}`;
-				if (denyReasonForPath(base)) return textResult(appendBlockedFootnote(`${base} [blocked]`));
-				const shouldPrune = !base.includes("/.git") && !base.includes("/node_modules") && !denyReasonForPath(`${base}/placeholder`);
-				const prune = shouldPrune ? findMarkedDenyExpression(pred) : "";
-				const script = `find ${shellQuote(base)} ${prune}${pred} -print | sed -n '1,${limit}p'`;
-				const r = await sshExec(target, script, signal, 45_000);
-				const matches = markBlockedFindEntries(r.stdout);
-				const output = matches.trim().length ? truncateText(matches, limit) : "No matches";
-				return textResult(appendSearchErrorSummary(output, r.stderr, showErrors, errorLimit), r.code !== 0 && r.stdout.trim().length === 0 && r.stderr.trim().length === 0);
+				const locate = await chooseCommand(target, "plocate", ["--", params.pattern], signal);
+				const r = await sshExec(target, `${locate.command} | sed -n '1,${limit}p'`, signal, 20_000);
+				let output = r.stdout.trim().length ? r.stdout : "No matches";
+				if (r.stderr) output += `
+[stderr]
+${r.stderr}`;
+				output = `Results are from plocate and may be stale.
+
+${output}`;
+				if (r.code !== 0 && permissionDenied(output) && !locate.usedSudo) output += `
+
+${sudoSetupHint(locate.commandPath)}`;
+				return textResult(appendSudoNote(truncateText(output, limit), locate.usedSudo, locate.sudoReason), r.code !== 0 && r.stdout.trim().length === 0);
 			} catch (err) {
 				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
-			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_find"))} ${theme.fg("accent", args.pattern ?? "...")} ${theme.fg("muted", args.path ?? ".")}`, 0, 0);
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_locate"))} ${theme.fg("accent", args.pattern ?? "...")} ${theme.fg("muted", args.target ?? "")}`, 0, 0);
 		},
 	});
 
 	pi.registerTool({
 		name: "sshro_grep",
 		label: "sshro_grep",
-		description: "Search remote files on the SSH Read-only Mode target. Recursive for directories, skips binary files, uses extended regex by default, and supports glob, ignoreCase, literal, context, and limit.",
-		promptSnippet: "sshro_grep: Search text files on the SSH Read-only Mode target using grep -E by default; use literal=true for grep -F. Recursive directory searches prune .git and node_modules by default and summarize permission errors unless showErrors=true.",
+		description: "Search remote files on an SSH target. Requires target. Uses grep with fixed wrapper options and may use sudo after sudo -n -l confirms access.",
+		promptSnippet: "sshro_grep: Search text files on an SSH target using grep -E by default; use literal=true for grep -F. Requires target. Recursive directory searches use grep -R with credential guardrail excludes.",
 		parameters: grepParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target, remoteCwd } = requireHealthy();
+				const target = await authorizeTarget(params.target, ctx, signal);
 				validatePathLike(params.pattern, "pattern");
 				if (params.glob) validatePathLike(params.glob, "glob");
-				const base = remotePath(params.path, remoteCwd);
+				const base = remotePath(params.path, ".");
+				assertPathAllowed(base);
 				const limit = validatePositiveLimit(params.limit, "limit", 500);
 				const showErrors = params.showErrors === true;
 				const errorLimit = validatePositiveLimit(params.errorLimit, "errorLimit", 20);
-				const opts = ["-nH", "-I"];
-				if (params.ignoreCase) opts.push("-i");
-				opts.push(params.literal ? "-F" : "-E");
-				if (params.context !== undefined) opts.push("-C", String(Math.max(0, Math.min(20, Math.floor(params.context)))));
-				const globPred = params.glob ? ` -name ${shellQuote(params.glob)}` : "";
-				assertPathAllowed(base);
-				const shouldPrune = !base.includes("/.git") && !base.includes("/node_modules") && !denyReasonForPath(`${base}/placeholder`);
-				const prune = shouldPrune ? findDenyExpression() : "";
-				const fileDeny = findFileDenyPredicates();
-				const script = `if [ -d ${shellQuote(base)} ]; then find ${shellQuote(base)} ${prune}-type f ${fileDeny}${globPred} -exec grep ${opts.join(" ")} -- ${shellQuote(params.pattern)} {} + | sed -n '1,${limit}p'; else grep ${opts.join(" ")} -- ${shellQuote(params.pattern)} ${shellQuote(base)} | sed -n '1,${limit}p'; fi`;
-				const r = await sshExec(target, script, signal, 60_000);
-				const output = r.stdout.trim().length ? truncateText(r.stdout, limit) : "No matches";
-				return textResult(appendSearchErrorSummary(output, r.stderr, showErrors, errorLimit));
+				const grepArgs = ["-nH", "-I"];
+				if (params.ignoreCase) grepArgs.push("-i");
+				grepArgs.push(params.literal ? "-F" : "-E");
+				if (params.context !== undefined) grepArgs.push("-C", String(Math.max(0, Math.min(20, Math.floor(params.context)))));
+				const test = await sshExec(target, `[ -d ${shellQuote(base)} ]`, signal, 10_000);
+				if (test.code === 0) {
+					grepArgs.push("-R");
+					for (const dir of [...DENIED_DIR_NAMES, ".git", "node_modules"]) grepArgs.push(`--exclude-dir=${dir}`);
+					for (const name of DENIED_FILE_NAMES) grepArgs.push(`--exclude=${name}`);
+					for (const prefix of DENIED_FILE_PREFIXES) grepArgs.push(`--exclude=${prefix}*`);
+					for (const suffix of DENIED_FILE_SUFFIXES) grepArgs.push(`--exclude=*${suffix}`);
+					if (params.glob) grepArgs.push(`--include=${params.glob}`);
+				}
+				grepArgs.push("--", params.pattern, base);
+				const grep = await chooseCommand(target, "grep", grepArgs, signal);
+				const r = await sshExec(target, `${grep.command} | sed -n '1,${limit}p'`, signal, 60_000);
+				const failed = r.code !== 0 && r.stdout.trim().length === 0 && r.stderr.trim().length > 0;
+				let output = r.stdout.trim().length ? truncateText(r.stdout, limit) : "No matches";
+				if (failed && permissionDenied(r.stderr) && !grep.usedSudo) output += `
+
+${sudoSetupHint(grep.commandPath)}`;
+				output = appendSearchErrorSummary(output, r.stderr, showErrors, errorLimit);
+				return textResult(appendSudoNote(output, grep.usedSudo, grep.sudoReason), failed);
 			} catch (err) {
 				return errorResult(err);
 			}
 		},
 		renderCall(args, theme) {
-			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_grep"))} ${theme.fg("accent", args.pattern ?? "...")} ${theme.fg("muted", args.path ?? ".")}`, 0, 0);
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_grep"))} ${theme.fg("accent", args.pattern ?? "...")} ${theme.fg("muted", args.path ?? ".")} ${theme.fg("muted", args.target ?? "")}`, 0, 0);
 		},
 	});
 
 	pi.registerTool({
 		name: "sshro_journalctl",
 		label: "sshro_journalctl",
-		description: "Read recent systemd journal logs from the SSH Read-only Mode target with optional unit/time/priority filters.",
+		description: "Read recent systemd journal logs from the SSH target with optional unit/time/priority filters.",
 		promptSnippet: "sshro_journalctl: Inspect recent systemd journal logs by unit, time range, priority, and grep filter.",
 		parameters: journalctlParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target } = requireHealthy();
+				const target = await authorizeTarget(params.target, ctx, signal);
 				const lines = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.lines ?? 200)));
 				const args = ["--no-pager", "--output=short-iso", "-n", String(lines)];
 				const unit = optionalString(params.unit);
@@ -822,13 +743,13 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "sshro_systemctl",
 		label: "sshro_systemctl",
-		description: "Inspect systemd unit state on the SSH Read-only Mode target. Supports failed, list, status, and show actions only.",
+		description: "Inspect systemd unit state on the SSH target. Supports failed, list, status, and show actions only.",
 		promptSnippet: "sshro_systemctl: Inspect systemd failed units, service lists, unit status, and selected unit properties.",
 		parameters: systemctlParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target } = requireHealthy();
+				const target = await authorizeTarget(params.target, ctx, signal);
 				const action = params.action;
 				const unit = optionalString(params.unit);
 				if ((action === "status" || action === "show") && !unit) throw new Error(`sshro_systemctl action '${action}' requires unit`);
@@ -858,9 +779,9 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		promptSnippet: "sshro_ps: Inspect remote processes, optionally filtered by owner or command-line pattern.",
 		parameters: psParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target } = requireHealthy();
+				const target = await authorizeTarget(params.target, ctx, signal);
 				const user = optionalString(params.user);
 				const pattern = optionalString(params.pattern);
 				if (user) validatePathLike(user, "user");
@@ -892,9 +813,9 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		promptSnippet: "sshro_ss: Inspect remote TCP/UDP socket state, especially listening ports.",
 		parameters: ssParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target } = requireHealthy();
+				const target = await authorizeTarget(params.target, ctx, signal);
 				const includeTcp = params.tcp !== false;
 				const includeUdp = params.udp !== false;
 				const proto = includeTcp || includeUdp ? `${includeTcp ? "t" : ""}${includeUdp ? "u" : ""}` : "tu";
@@ -925,9 +846,10 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 		promptSnippet: "sshro_df: Inspect remote filesystem free space; defaults to df -l for local filesystems only.",
 		parameters: dfParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target, remoteCwd } = requireHealthy();
+				const target = await authorizeTarget(params.target, ctx, signal);
+				const remoteCwd = ".";
 				const path = optionalString(params.path);
 				const resolvedPath = path ? remotePath(path, remoteCwd) : undefined;
 				if (resolvedPath) assertPathAllowed(resolvedPath);
@@ -950,13 +872,13 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "sshro_docker_ps",
 		label: "sshro_docker_ps",
-		description: "List Docker containers on the SSH Read-only Mode target using compact Docker table output. Docker is checked at tool runtime.",
+		description: "List Docker containers on the SSH target using compact Docker table output. Docker is checked at tool runtime.",
 		promptSnippet: "sshro_docker_ps: List active Docker containers with docker ps --no-trunc. Use all=true to include stopped/exited containers.",
 		parameters: dockerPsParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target } = requireHealthy();
+				const target = await authorizeTarget(params.target, ctx, signal);
 				const limit = validatePositiveLimit(params.limit, "limit", 100);
 				const name = optionalString(params.name);
 				if (name) validateDockerRef(name, "name");
@@ -981,17 +903,17 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "sshro_docker_inspect",
 		label: "sshro_docker_inspect",
-		description: "Inspect a Docker object on the SSH Read-only Mode target. Returns curated JSON with environment variables visibly redacted.",
+		description: "Inspect a Docker object on the SSH target. Returns curated JSON with environment variables visibly redacted.",
 		promptSnippet: "sshro_docker_inspect: Inspect Docker metadata as JSON; curated output redacts environment variables by default.",
 		parameters: dockerInspectParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target } = requireHealthy();
-				validateDockerRef(params.target, "target");
+				const target = await authorizeTarget(params.target, ctx, signal);
+				validateDockerRef(params.object, "object");
 				const kind = optionalString(params.kind);
 				if (kind && !(DOCKER_KINDS as readonly string[]).includes(kind)) throw new Error(`kind must be one of: ${DOCKER_KINDS.join(", ")}`);
-				const args = kind ? [`--type`, shellQuote(kind), shellQuote(params.target)] : [shellQuote(params.target)];
+				const args = kind ? [`--type`, shellQuote(kind), shellQuote(params.object)] : [shellQuote(params.object)];
 				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker inspect ${args.join(" ")}`;
 				const r = await sshExec(target, script, signal, 20_000);
 				if (r.code !== 0) return textResult(`docker inspect failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, true);
@@ -1007,20 +929,20 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 			}
 		},
 		renderCall(args, theme) {
-			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_docker_inspect"))} ${theme.fg("accent", args.target ?? "...")}`, 0, 0);
+			return new Text(`${theme.fg("toolTitle", theme.bold("sshro_docker_inspect"))} ${theme.fg("accent", args.object ?? "...")} ${theme.fg("muted", args.target ?? "")}`, 0, 0);
 		},
 	});
 
 	pi.registerTool({
 		name: "sshro_docker_stats",
 		label: "sshro_docker_stats",
-		description: "Show one-shot Docker container stats on the SSH Read-only Mode target as JSON where Docker supports it. Never streams.",
+		description: "Show one-shot Docker container stats on the SSH target as JSON where Docker supports it. Never streams.",
 		promptSnippet: "sshro_docker_stats: Show one-shot Docker container CPU/memory/network/block stats; uses --no-stream. CPU can be noisy; call again a few seconds later to compare.",
 		parameters: dockerStatsParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target } = requireHealthy();
+				const target = await authorizeTarget(params.target, ctx, signal);
 				const limit = validatePositiveLimit(params.limit, "limit", 100);
 				const container = optionalString(params.container);
 				if (container) validateDockerRef(container, "container");
@@ -1045,13 +967,13 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "sshro_dig",
 		label: "sshro_dig",
-		description: "Run a bounded read-only DNS lookup from the SSH Read-only Mode target using dig. dig is checked at tool runtime.",
+		description: "Run a bounded read-only DNS lookup from the SSH target using dig. dig is checked at tool runtime.",
 		promptSnippet: "sshro_dig: Debug DNS resolution from the remote host using dig +time=3 +tries=1. Optional server uses @server; short=true uses +short.",
 		parameters: digParams,
 		executionMode: "parallel",
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
-				const { target } = requireHealthy();
+				const target = await authorizeTarget(params.target, ctx, signal);
 				const name = optionalString(params.name);
 				if (!name) throw new Error("name is required");
 				validatePathLike(name, "name");
@@ -1074,59 +996,21 @@ function registerSshRoTools(pi: ExtensionAPI): void {
 	});
 }
 
-function failClosed(pi: ExtensionAPI, ctx: ExtensionContext, target: string, reason: string): void {
-	state = { active: true, target, fatal: true, reason };
-	pi.setActiveTools([]);
-	ctx.ui.setStatus("ssh-ro", ctx.ui.theme.fg("error", `SSH RO failed: ${target}`));
-	ctx.ui.notify(`SSH Read-only Mode startup failed for ${target}: ${reason}`, "error");
-}
-
-async function activateSshRo(pi: ExtensionAPI, ctx: ExtensionContext, target: string): Promise<void> {
-	if (state.active && !state.fatal) {
-		throw new Error(`SSH Read-only Mode is already active for ${state.target}. Run /sshro logout first.`);
-	}
-	validateTarget(target);
-	const remoteCwd = await startupCheck(target);
-	previousActiveTools = pi.getActiveTools();
-	registerSshRoTools(pi);
-	state = { active: true, target, remoteCwd, fatal: false };
-	pi.setActiveTools([...ACTIVE_SSHRO_TOOL_NAMES]);
-	ctx.ui.setStatus("ssh-ro", ctx.ui.theme.fg("accent", `SSH RO ${target} (! remote)`));
-	ctx.ui.notify(`SSH Read-only Mode: ${target} (remote cwd ${remoteCwd})`, "info");
-	pi.sendMessage({
-		customType: "ssh-ro-info",
-		content: sshRoModeNote(target, remoteCwd),
-		display: true,
-		details: { target, remoteCwd, tools: ACTIVE_SSHRO_TOOL_NAMES },
-	});
-}
-
-function deactivateSshRo(pi: ExtensionAPI, ctx: ExtensionContext): void {
-	if (!state.active) {
-		ctx.ui.notify("SSH Read-only Mode is not active", "info");
-		return;
-	}
-	state = { active: false };
-	if (previousActiveTools) pi.setActiveTools(previousActiveTools);
-	previousActiveTools = undefined;
-	ctx.ui.setStatus("ssh-ro", undefined);
-	ctx.ui.notify("SSH Read-only Mode ended", "info");
-}
-
 export default function sshReadonlyExtension(pi: ExtensionAPI) {
 	pi.registerFlag("ssh-ro", {
 		type: "string",
-		description: "Start SSH Read-only Mode against an SSH target, e.g. pi --ssh-ro user@server",
+		description: "Pre-approve an exact SSH target for stateless sshro_* tool calls, e.g. pi --ssh-ro user@server",
 	});
 
-	registerSshRoConnectTool(pi);
+	registerSshRoTools(pi);
 
 	pi.registerCommand("sshro", {
-		description: "Enter SSH Read-only Mode for a known SSH host, or leave it with /sshro logout",
+		description: "Pre-approve an exact SSH target for stateless sshro_* tool calls, or clear approvals with /sshro logout",
 		handler: async (args, ctx) => {
 			const value = (args ?? "").trim();
 			if (value === "logout") {
-				deactivateSshRo(pi, ctx);
+				approvedTargets.clear();
+				ctx.ui.notify("SSH read-only session approvals cleared", "info");
 				return;
 			}
 			if (!value) {
@@ -1134,7 +1018,9 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 				return;
 			}
 			try {
-				await activateSshRo(pi, ctx, value);
+				validateTarget(value);
+				approvedTargets.add(value);
+				ctx.ui.notify(`SSH read-only target approved for this Pi session: ${value}`, "info");
 			} catch (err) {
 				ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
 			}
@@ -1143,48 +1029,21 @@ export default function sshReadonlyExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		const raw = pi.getFlag("ssh-ro");
-		if (typeof raw !== "string" || raw.length === 0) {
-			state = { active: false };
-			return;
-		}
-
+		if (typeof raw !== "string" || raw.length === 0) return;
 		try {
-			await activateSshRo(pi, ctx, raw.trim());
+			const target = raw.trim();
+			validateTarget(target);
+			approvedTargets.add(target);
+			ctx.ui.notify(`SSH read-only target approved for this Pi session: ${target}`, "info");
 		} catch (err) {
-			const target = typeof raw === "string" ? raw.trim() : "<unknown>";
-			failClosed(pi, ctx, target, err instanceof Error ? err.message : String(err));
+			ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
 		}
-	});
-
-	pi.on("user_bash", () => {
-		if (!state.active) return;
-		if (state.fatal) {
-			return { result: { output: `SSH Read-only Mode startup failed: ${state.reason}`, exitCode: 1, cancelled: false, truncated: false } };
-		}
-		return { operations: sshBashOperations(state.target, state.remoteCwd) };
 	});
 
 	pi.on("tool_call", (event) => {
-		if (event.toolName === "bash") {
-			const command = typeof (event.input as { command?: unknown }).command === "string" ? (event.input as { command: string }).command : "";
-			const reason = bashSshBlockReason(command);
-			if (reason) return { block: true, reason };
-		}
-
-		if (!state.active) return;
-		if (state.fatal) return { block: true, reason: `SSH Read-only Mode startup failed: ${state.reason}` };
-		if (event.toolName === SSHRO_CONNECT_TOOL) return;
-		if (!ACTIVE_SSHRO_TOOL_NAMES.includes(event.toolName as (typeof ACTIVE_SSHRO_TOOL_NAMES)[number])) {
-			return { block: true, reason: `SSH Read-only Mode allows only: ${ACTIVE_SSHRO_TOOL_NAMES.join(", ")}` };
-		}
-	});
-
-	pi.on("before_agent_start", (event) => {
-		if (!state.active || state.fatal) return;
-		const localCwd = process.cwd();
-		const remoteLine = `Current working directory: ${state.remoteCwd} (SSH Read-only Mode target: ${state.target})`;
-		let systemPrompt = event.systemPrompt.replace(`Current working directory: ${localCwd}`, remoteLine);
-		systemPrompt += `\n\n${sshRoModeNote(state.target, state.remoteCwd)}\n`;
-		return { systemPrompt };
+		if (event.toolName !== "bash") return;
+		const command = typeof (event.input as { command?: unknown }).command === "string" ? (event.input as { command: string }).command : "";
+		const reason = bashSshBlockReason(command);
+		if (reason) return { block: true, reason };
 	});
 }
