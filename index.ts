@@ -294,23 +294,22 @@ async function chooseCommand(target: string, command: string, args: string[], si
 	return { commandPath, command: sudo.allowed ? `sudo -n ${base}` : base, usedSudo: sudo.allowed, sudoReason: sudo.reason };
 }
 
-function sudoNote(usedSudo: boolean, sudoReason: string): string {
-	if (usedSudo) return "[ssh-ro note] Used sudo: yes";
-	if (/password is required|a terminal is required|no tty/i.test(sudoReason)) return "[ssh-ro note] Used sudo: no; sudo requires a password/tty for this command.";
-	return "[ssh-ro note] Used sudo: no; sudo permission was not available for this command.";
+function sudoMeta(usedSudo: boolean, sudoReason: string): string {
+	if (usedSudo) return "sudo: yes";
+	if (/password is required|a terminal is required|no tty/i.test(sudoReason)) return "sudo: no (password/tty required)";
+	return "sudo: no (not allowed)";
 }
 
-function remoteMetaFooter(target: string, remoteTime?: string): string {
-	return `[ssh-ro: ${target}${remoteTime ? ` | remote time: ${remoteTime}` : ""}]`;
+function remoteMetaFooter(target: string, remoteTime?: string, sudo?: string): string {
+	return `[ssh-ro: ${[target, sudo, remoteTime ? `remote time: ${remoteTime}` : undefined].filter(Boolean).join(" | ")}]`;
 }
 
-function appendRemoteMeta(output: string, target: string, remoteTime?: string): string {
-	return `${output.trimEnd()}\n\n${remoteMetaFooter(target, remoteTime)}`;
+function appendRemoteMeta(output: string, target: string, remoteTime?: string, sudo?: string): string {
+	return `${output.trimEnd()}\n\n${remoteMetaFooter(target, remoteTime, sudo)}`;
 }
 
 function appendSudoNote(output: string, usedSudo: boolean, sudoReason: string, target?: string, remoteTime?: string): string {
-	const withSudo = `${output.trimEnd()}\n\n${sudoNote(usedSudo, sudoReason)}`;
-	return target ? appendRemoteMeta(withSudo, target, remoteTime) : withSudo;
+	return target ? appendRemoteMeta(output, target, remoteTime, sudoMeta(usedSudo, sudoReason)) : `${output.trimEnd()}\n\n[ssh-ro: ${sudoMeta(usedSudo, sudoReason)}]`;
 }
 
 function permissionDenied(text: string): boolean {
@@ -363,6 +362,18 @@ function markBlockedFindEntries(output: string): string {
 		.map((line) => {
 			if (!line.trim() || line.startsWith("find:")) return line;
 			return denyReasonForPath(line.trim()) ? `${line} [blocked]` : line;
+		})
+		.join("\n");
+	return appendBlockedFootnote(marked);
+}
+
+function markBlockedRecursiveLsEntries(output: string): string {
+	const marked = output
+		.split("\n")
+		.map((line) => {
+			const match = line.match(/(\/.*?)(?: -> |$)/);
+			if (!match) return line;
+			return denyReasonForPath(match[1].trim()) ? `${line} [blocked]` : line;
 		})
 		.join("\n");
 	return appendBlockedFootnote(marked);
@@ -643,7 +654,7 @@ ${sudoSetupHint(read.commandPath)}`;
 				const chosen = await chooseCommand(target, commandName, args, signal);
 				const filter = ezaPath ? ` | grep -Ev '^(/|$)'` : "";
 				const r = await sshExec(target, `LC_ALL=C ${chosen.command}${filter} | sed -n '1,${limit}p'`, signal, recursive ? 45_000 : 30_000);
-				const stdout = r.code === 0 && !recursive ? markBlockedLsEntries(r.stdout, p) : r.stdout;
+				const stdout = r.code === 0 ? (recursive ? markBlockedRecursiveLsEntries(r.stdout) : markBlockedLsEntries(r.stdout, p)) : r.stdout;
 				let combined = `${stdout}${r.stderr ? `
 [stderr]
 ${r.stderr}` : ""}`;
@@ -719,11 +730,11 @@ ${sudoSetupHint(locate.commandPath)}`;
 				const test = await sshExec(target, `[ -d ${shellQuote(base)} ]`, signal, 10_000);
 				if (test.code === 0) {
 					grepArgs.push("-R");
+					if (params.glob) grepArgs.push(`--include=${params.glob}`);
 					for (const dir of [...DENIED_DIR_NAMES, ".git", "node_modules"]) grepArgs.push(`--exclude-dir=${dir}`);
 					for (const name of DENIED_FILE_NAMES) grepArgs.push(`--exclude=${name}`);
 					for (const prefix of DENIED_FILE_PREFIXES) grepArgs.push(`--exclude=${prefix}*`);
 					for (const suffix of DENIED_FILE_SUFFIXES) grepArgs.push(`--exclude=*${suffix}`);
-					if (params.glob) grepArgs.push(`--include=${params.glob}`);
 				}
 				grepArgs.push("--", params.pattern, base);
 				const grep = await chooseCommand(target, "grep", grepArgs, signal);
