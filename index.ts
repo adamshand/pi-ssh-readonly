@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import Type from "typebox";
+import { bashSshBlockReason } from "./src/bash-ssh-guard.ts";
 
 const SSHRO_HOST_WHITELIST_ENV = "SSHRO_HOST_WHITELIST";
 const DEFAULT_LINE_LIMIT = 2000;
@@ -12,20 +13,6 @@ const DENIED_PATH_PARTS = ["/.config/gcloud", "/.config/gh", "/.config/Bitwarden
 const DENIED_FILE_NAMES = [".env", ".netrc", ".npmrc", ".pypirc", ".gitconfig", ".git-credentials", "terraform.tfstate", ".chezmoi.toml", ".chezmoi.yaml", ".chezmoi.json", ".chezmoiignore", ".bash_history", ".zsh_history", ".zhistory", ".fish_history", "fish_history", ".sh_history", ".ash_history", ".history", "search_history", ".mysql_history", ".psql_history", ".sqlite_history", ".python_history", ".node_repl_history", ".rediscli_history", ".lesshst", ".wget-hsts", "environ", "kcore"];
 const DENIED_FILE_SUFFIXES = [".env", ".pem", ".key", ".p12", ".pfx", "_history"];
 const DENIED_FILE_PREFIXES = [".env.", "terraform.tfstate."];
-const SSH_CLIENT_COMMAND_PATTERN = String.raw`(?:ssh|scp|sftp|sshfs|ssh-keyscan|sshpass|autossh|mosh|slogin|plink|pscp|psftp)`;
-const SSH_COMMAND_RE = new RegExp(
-	String.raw`(^|[\n;&|(){}])\s*` +
-		String.raw`(?:(?:sudo|doas|command|builtin|exec|nohup|time|setsid)\s+|env\s+(?:-[^\s]+\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*)*` +
-		String.raw`(?:[^\s;&|()<>]+/)?${SSH_CLIENT_COMMAND_PATTERN}(?=$|[\s;&|()<>])`,
-	"i",
-);
-const SHELL_C_SSH_RE = new RegExp(
-	String.raw`\b(?:sh|bash|zsh|fish|dash|ksh)\s+(?:-[A-Za-z]*c[A-Za-z]*|-c)\s+(?:"[^"]*${SSH_CLIENT_COMMAND_PATTERN}\b|'[^']*${SSH_CLIENT_COMMAND_PATTERN}\b)`,
-	"i",
-);
-const SSH_TRANSPORT_RE = /\b(?:ssh|sftp|scp):\/\/|\bgit@[-A-Za-z0-9_.]+:/i;
-const SSH_ENV_RE = /\b(?:GIT_SSH|GIT_SSH_COMMAND|RSYNC_RSH)\s*=/i;
-
 let toolsRegistered = false;
 const approvedTargets = new Set<string>();
 const pendingTargetApprovals = new Map<string, Promise<boolean>>();
@@ -66,13 +53,6 @@ function whitelistedHostsPromptHint(): string {
 function validatePathLike(value: string, label: string): void {
 	if (hasControlChars(value)) throw new Error(`${label} contains a newline or control character`);
 	if (value === "~" || value.startsWith("~/")) throw new Error(`${label}: ~ expansion is not supported in SSH Read-only Mode v1`);
-}
-
-function bashSshBlockReason(command: string): string | undefined {
-	if (SSH_COMMAND_RE.test(command) || SHELL_C_SSH_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from invoking SSH client commands. Use the stateless sshro_* tools with an explicit target, or user-run ! commands instead.";
-	if (SSH_TRANSPORT_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from using SSH transport URLs.";
-	if (SSH_ENV_RE.test(command)) return "The pi-ssh-readonly extension blocks agent bash from configuring SSH transport environment variables.";
-	return undefined;
 }
 
 function normalizeRemotePathForPolicy(path: string): string {
@@ -280,8 +260,12 @@ async function checkSudoAllowed(target: string, commandPath: string, args: strin
 	const key = `${target}\0${commandPath}\0${args.join("\0")}`;
 	const cached = sudoCheckCache.get(key);
 	if (cached) return cached;
-	const r = await sshExec(target, `sudo -n -l ${commandString(commandPath, args)} >/dev/null`, signal, 10_000);
-	const result = { allowed: r.code === 0, reason: (r.stderr || r.stdout).trim() };
+	const r = await sshExec(target, `sudo -n -l -- ${commandString(commandPath, args)} 2>&1`, signal, 10_000);
+	const output = `${r.stdout}\n${r.stderr}`.trim();
+	const hasNoPasswd = /\bNOPASSWD\s*:/i.test(output);
+	const result = r.code === 0 && hasNoPasswd
+		? { allowed: true, reason: output }
+		: { allowed: false, reason: r.code === 0 ? "sudo command is allowed but is not marked NOPASSWD" : output };
 	sudoCheckCache.set(key, result);
 	return result;
 }
@@ -296,7 +280,7 @@ async function chooseCommand(target: string, command: string, args: string[], si
 
 function sudoMeta(usedSudo: boolean, sudoReason: string): string {
 	if (usedSudo) return "sudo: yes";
-	if (/password is required|a terminal is required|no tty/i.test(sudoReason)) return "sudo: no (password/tty required)";
+	if (/password is required|not marked NOPASSWD|a terminal is required|no tty/i.test(sudoReason)) return "sudo: no (password/tty required)";
 	return "sudo: no (not allowed)";
 }
 

@@ -76,7 +76,9 @@ You can run a local shell command and automatically feed it back to the agent by
 ! echo 'the agent can see this'
 ```
 
-Whenever this extension is loaded, agent-initiated `bash` tool calls are blocked from invoking common SSH client commands or SSH transport URLs. The agent should use the `sshro_*` tools instead. User-run `!` and `!!` commands are not blocked by this guard.
+Whenever this extension is loaded, agent-initiated `bash` tool calls are blocked from directly invoking common SSH client commands. The agent should use the `sshro_*` tools instead. User-run `!` and `!!` commands are not blocked by this guard.
+
+Git-over-SSH is intentionally allowed, including explicit `git@host:path` and `ssh://` remote URLs and the standard `GIT_SSH` / `GIT_SSH_COMMAND` environment variables. This permits normal clone, fetch, pull, and push workflows; **pushes can modify a remote repository**. The bash guard is only a best-effort tripwire against accidental direct SSH use—not a process or network sandbox. Indirect SSH execution and non-SSH network tools remain possible. For an actual security boundary, run agent-controlled local tools in a sandbox such as Gondolin while leaving the fixed `sshro_*` tools and SSH credentials in the trusted host process.
 
 ## Configuration
 
@@ -110,7 +112,7 @@ Host *
 
 Tool results include a compact footer with the SSH target and remote server time, e.g. `[ssh-ro: white | remote time: 2026-05-29T22:14:03+12:00]`, so log and mtime output has clock context without a separate tool call.
 
-Some tools can use elevated read-only access when sudoers allows the exact fixed command. Before running any elevated command the extension checks `sudo -n -l <command ...>`; if sudo requires a password or the command is not allowed, the tool falls back to the non-sudo command and reports that elevated access was unavailable. This avoids noisy failed sudo command attempts. Example sudoers additions for a trusted account on servers you control:
+Some tools can use elevated read-only access when sudoers allows the exact fixed command with `NOPASSWD`. Before running any elevated command the extension checks `sudo -n -l -- <command ...>` and requires the matching sudoers output to include `NOPASSWD:`; if sudo requires a password or the command is not allowed, the tool falls back to the non-sudo command and reports that elevated access was unavailable. This avoids noisy failed sudo command attempts. Example sudoers additions for a trusted account on servers you control:
 
 ```sudoers
 agent ALL=(root) NOPASSWD: /usr/bin/cat *
@@ -132,6 +134,7 @@ Docker tools are optional and checked when the tool runs, not at startup. `sshro
 
 ## Known Issues
 
+- The agent `bash` guard is deliberately not a security boundary. Git-over-SSH is allowed, and indirect SSH execution or other remote mutation protocols cannot be reliably blocked by inspecting shell command text.
 - Currently doesn't stop protected paths being accessed via a symlink.
 - Provided tools are quite limited.  
 
