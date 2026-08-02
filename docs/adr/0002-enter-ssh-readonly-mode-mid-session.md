@@ -1,5 +1,7 @@
 # Enter SSH Read-only Mode mid-session with /sshro
 
+> **Superseded by [ADR 0003](0003-agent-connect-with-whitelist-and-approval.md) and [ADR 0004](0004-load-ssh-inspection-tools-after-target-approval.md).** The extension is now stateless and target-explicit rather than a modal single-target mode.
+
 SSH Read-only Mode can now be entered during an existing pi session with `/sshro <target>` and exited with `/sshro logout`, while keeping `--ssh-ro <target>` as a startup path. This preserves conversation context and avoids requiring users to quit and restart pi with `-c` or `--session`.
 
 The slash command intentionally uses the short form `/sshro <target>` rather than subcommands like `/sshro login` or `/sshro connect`; logout remains explicit because it is the only non-target command. While active, attempts to connect to another target are rejected with instructions to run `/sshro logout` first. We avoid implicit target switching to keep the read-only boundary obvious.

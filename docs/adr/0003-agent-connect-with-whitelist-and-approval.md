@@ -1,6 +1,8 @@
 # Use exact-target approval for stateless SSH read-only tools
 
-The agent can use `sshro_*` tools directly alongside normal local tools. Each call includes an explicit `target`, for example `sshro_read({ target, path })` or `sshro_ls({ target, path, recursive: true })`.
+> **Refined by [ADR 0004](0004-load-ssh-inspection-tools-after-target-approval.md).** Inspection calls remain stateless and target-explicit, but `sshro_connect` is now the initially active bootstrap that loads their definitions on demand.
+
+After the Inspection Tool Suite is loaded, the agent can use `sshro_*` tools directly alongside normal local tools. Each call includes an explicit `target`, for example `sshro_read({ target, path })` or `sshro_ls({ target, path, recursive: true })`.
 
 Agent-initiated target use still preserves human control. The extension validates the target and checks `SSHRO_HOST_WHITELIST`, a comma-separated list of exact target strings read from the pi process environment. If the requested target is present, the tool can run immediately. If it is absent and the exact target has not already been approved in this Pi session, the extension prompts the human for approval before making any SSH inspection attempt. In non-interactive modes, non-whitelisted requests fail closed because approval is impossible.
 

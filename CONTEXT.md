@@ -1,80 +1,70 @@
 # SSH Read-only Extension
 
-This context covers a pi extension that lets agents inspect remote Linux servers over SSH without exposing mutation tools.
+This context covers a pi extension that lets agents inspect remote Linux servers over SSH without exposing remote mutation capabilities.
 
 ## Language
 
 **SSH Read-only Tool**:
-An explicit `sshro_*` tool whose behavior is implemented against a remote server over SSH while preserving familiar read/list/search parameters where useful.
-_Avoid_: overloaded built-in tool names, local/remote ambiguity
+A target-explicit capability that inspects a remote server without offering arbitrary shell execution or mutation.
+_Avoid_: overloaded built-in tool, remote command tool, SSH shell
+
+**SSH Read-only Bootstrap Tool**:
+The minimal agent-facing capability that discovers or requests Target Approval before making the Inspection Tool Suite available. It does not inspect or connect to a remote host.
+_Avoid_: connection, probe, remote session
+
+**Inspection Tool Suite**:
+The detailed collection of SSH Read-only Tools made available on demand after a target can be used without another approval.
+_Avoid_: remote mode, implicit-target tools
+
+**Exact Target**:
+The literal single-argument OpenSSH destination string supplied to a tool, such as `server` or `user@server`. Distinct strings remain distinct even if OpenSSH resolves them to the same host. Option-shaped, whitespace-containing, control-character, path-suffixed, and IPv6 values are rejected in v1.
+_Avoid_: canonical host, active host
 
 **Target Approval**:
-The per-session approval state for an exact SSH target string used by stateless `sshro_*` tools.
-_Avoid_: canonical host approval, hidden current host
+Human consent for the agent to use one Exact Target during the current Pi session. Approval authorizes the fixed Inspection Tool Suite, not arbitrary remote execution.
+_Avoid_: connection approval, host trust, unrestricted SSH access
 
 **SSHRO Host Whitelist**:
-The `SSHRO_HOST_WHITELIST` environment variable whose comma-separated exact target strings allow agent-initiated `sshro_*` calls to run without prompting the human.
-_Avoid_: denylist, canonical host policy, SSH config parser
+A configured set of Exact Targets that may receive Target Approval automatically.
+_Avoid_: denylist, SSH config aliases, network access policy
+
+**Suggested Target**:
+A literal alias discovered from trusted local SSH configuration and shown to the human as a convenience. Discovery alone never grants Target Approval.
+_Avoid_: approved alias, whitelisted host
 
 **Fixed Remote Command Template**:
-A remote shell command assembled from known read-only command shapes with every user-controlled path, pattern, and option shell-quoted.
-_Avoid_: arbitrary remote shell, server-side helper script
+A known read-only command shape whose variable values are validated and shell-quoted.
+_Avoid_: arbitrary remote shell, user-authored command
+
+**Canonical Remote Path**:
+The existing remote path obtained after resolving symlinks and normalization, used for content-access policy decisions.
+_Avoid_: raw path, display path
 
 **Elevated Read-only Command**:
-A fixed command run through `sudo -n` only after `sudo -n -l <exact command ...>` confirms the SSH user may run that exact command without a password.
-_Avoid_: blind sudo attempt, password prompt, NOPASSWD ALL
-
-**System SSH Client**:
-The local OpenSSH command-line client used by the extension for remote access, preserving normal SSH config behavior such as aliases, ProxyJump, ControlMaster sockets, ports, and identities.
-_Avoid_: SSH library, custom SSH config parser
+A Fixed Remote Command Template run with non-interactive sudo only after policy inspection confirms that exact command is permitted without a password.
+_Avoid_: blind sudo attempt, password prompt, privileged shell
 
 **Visible Search Errors**:
-Permission and traversal errors returned by remote search tools so the agent can distinguish absence of evidence from inaccessible evidence.
-_Avoid_: hidden permission errors, silent stderr suppression
+Search diagnostics that let the agent distinguish no evidence from inaccessible evidence.
+_Avoid_: hidden permission errors, silent traversal failure
 
-## Relationships
+## Invariants and relationships
 
-- The extension is a **Global Auto-loaded Extension** and registers the `sshro_*` tools alongside normal local pi tools; it no longer requires a modal remote-only state for agent tool use.
-- Every `sshro_*` tool call requires an explicit `target` parameter. The extension does not keep a hidden current SSH host for agent tools.
-- `/sshro <target>` and `--ssh-ro <target>` pre-approve that exact target for the current Pi session. `/sshro logout` clears session approvals.
-- The current read-only tool set is `sshro_read`, `sshro_ls`, `sshro_locate`, `sshro_grep`, `sshro_journalctl`, `sshro_systemctl`, `sshro_ps`, `sshro_ss`, `sshro_df`, `sshro_docker_ps`, `sshro_docker_inspect`, `sshro_docker_stats`, and `sshro_dig`.
-- If a target exactly matches `SSHRO_HOST_WHITELIST`, the tool runs without prompting. If the target was previously approved in the same Pi session, the tool runs without prompting. Otherwise the extension asks the human to approve that exact target before any SSH inspection command is attempted.
-- Target approval is exact-string and in-memory/session-only. `binney` and `adam@binney` are distinct targets even if OpenSSH resolves them to the same host.
-- Non-whitelisted tool calls fail closed when no UI is available because human approval is impossible.
-- OpenSSH still resolves aliases, ProxyJump, identities, ControlMaster sockets, and other SSH configuration normally when a tool runs.
-- SSH uses `BatchMode=yes` and `StrictHostKeyChecking=yes`; authentication and host verification must already be configured.
-- Agent-initiated local `bash` calls are blocked from directly invoking common SSH client commands so the agent uses audited `sshro_*` tools instead. Human-run `!` and `!!` commands are not blocked.
-- Git-over-SSH transport, including `GIT_SSH` and `GIT_SSH_COMMAND`, is intentionally allowed for normal clone/fetch/pull/push workflows. A Git push can mutate a remote repository. The bash guard is a best-effort accidental-use tripwire, not a process or network sandbox; hardened deployments isolate agent-controlled local tools externally while keeping `sshro_*` and SSH credentials in the trusted host process.
-- Paths are remote paths. Relative paths resolve from the SSH login directory for that tool call. `~` expansion is rejected; use absolute home paths such as `/home/name` or paths relative to the remote login directory.
-- The extension does not install a server-side helper, SUID binary, forced command gateway, or root SSH account. Elevated access is delegated entirely to the server's sudoers policy.
-- Before any elevated command is run, the tool checks `sudo -n -l -- <exact fixed command ...>`. The extension only runs `sudo -n <command ...>` when that check succeeds and the sudoers output includes `NOPASSWD:`.
-- If `sudo -n -l` reports that a password/tty is required, the exact command is not allowed, or the match is password-required rather than `NOPASSWD`, the tool falls back to the non-sudo command and reports that elevated access was unavailable.
-- Sudo capability checks are cached per Pi session by target, command path, and exact arguments.
-- If a non-sudo fallback fails with permission denied and sudo was unavailable, tool output includes a human-facing sudoers setup hint for the relevant fixed command. `sshro_journalctl` is sudo-aware because normal users often cannot see system/service journal entries. `sshro_systemctl status` is also sudo-aware and intentionally checks `systemctl --no-pager status <unit>` so a sudoers rule like `/usr/bin/systemctl --no-pager status *` matches.
-- Each SSH command appends a remote time marker to stderr; `sshExec` strips the marker from stderr and tool results include a footer such as `[ssh-ro: target | remote time: 2026-05-29T22:14:03+12:00]` for log/mtime context.
-- `sshro_read` keeps `path`, `offset`, and `limit`. It reads through fixed `cat -- path`, optionally via sudo after approval. Before returning content, it samples the same `cat` command, pipes the sample through remote `file --mime-type -b -`, refuses non-text MIME types, then applies line slicing with remote `head`/`tail`.
-- `sshro_ls` returns metadata, includes hidden files by default, and supports `recursive: true` for live recursive listings.
-- Recursive `sshro_ls` prefers `eza -1l --absolute=on -R --color=never --icons=never -- path`, filters eza grouping-folder headers, and falls back to `ls -laR` when `eza` is unavailable.
-- `sshro_locate` uses `plocate` for fast indexed path search. Results may be stale. No regex option is exposed initially.
-- `sshro_grep` uses `grep -E` by default, searches directories recursively with `grep -R`, skips binary files, supports `glob`, and uses `grep -F` when `literal: true`.
-- Direct content reads and recursive grep exclude `.env`, `*.env`, shell history, private key/certificate extensions, `.git`, `node_modules`, and common credential/history/password-manager/dotfile-manager paths by default. This is not a chroot or adversarial DLP boundary.
-- Tool paths and patterns reject newlines/control characters while allowing ordinary spaces and punctuation through shell quoting.
-- Tool-specific SSH timeouts and pi-like output limits bound remote inspections.
-- Docker tools are optional runtime diagnostics. `sshro_docker_inspect` uses `target` for the SSH target and `object` for the Docker object name/ID.
-- Docker inspect output redacts environment variables and sensitive-looking labels and omits image `GraphDriver.Data`.
+- `sshro_connect` is the only SSH read-only tool active initially. It approves or discovers an Exact Target and additively enables the Inspection Tool Suite; it does not open a network connection.
+- Every Inspection Tool remains target-explicit. There is no hidden active host or remote-only mode, and unrelated local/extension tools remain available.
+- Suggested Targets come only from bounded parsing of trusted local SSH configuration. Suggestions never extend the SSHRO Host Whitelist and become approved only through a human action.
+- Automatic approval compares validated Exact Targets literally. Human approval is branch-independent process-memory state for the current Pi session, survives hot reload through the latest versioned non-context session snapshot, and does not cross process restart or session replacement.
+- `--ssh-ro` applies only at initial process startup. `/sshro logout` remains effective across later hot reloads.
+- Pending approval results are generation-bound: logout or shutdown invalidates stale confirmations before they can mutate approval state.
+- OpenSSH receives an option terminator before the Exact Target. Remote command discovery is cached only after the remote wrapper completes, so transport failure remains visible and retryable.
+- Existing content paths are checked lexically and again as Canonical Remote Paths. This blocks ordinary symlink bypasses but does not eliminate remote time-of-check/time-of-use races.
+- Producer status is carried outside remote filters. Expected no-match/inactive states and intentional bounded-read SIGPIPE are informative success; other failures are Pi tool errors.
+- “Read-only” describes the capabilities offered by this extension, not zero observable writes: SSH/audit logs, access times, DNS queries, shell startup hooks, and remote binaries can have side effects.
+- The agent bash guard is an accidental-use tripwire, not a process/network sandbox. Git-over-SSH, including mutation by push, remains intentionally allowed.
 
-## Example dialogue
+## Decision index
 
-> **Dev:** "Can the agent inspect a remote server and then read local project files?"
-> **Domain expert:** "Yes — the `sshro_*` tools are stateless and target-explicit, so local tools remain available in the same conversation."
->
-> **Dev:** "If the agent uses `sshro_ls({ target: \"root@server\", path: \"/etc\", recursive: true })`, is `/etc` confined by where pi was launched?"
-> **Domain expert:** "No — paths are remote paths. The local launch directory is irrelevant, and absolute remote paths remain accessible subject to tool guardrails and remote OS permissions."
-
-## Flagged ambiguities
-
-- Tool names could either be SSH-specific or reuse pi built-in names; resolved: use explicit `sshro_*` names for clarity and auditability.
-- Recursive path discovery could be exposed as `sshro_find`, `sshro_eza`, or `sshro_ls`; resolved: use `sshro_ls({ recursive: true })` because the agent asks for intent-level listing and should not need to know the backend implementation.
-- Locate pattern could be regex by default or expose a regex option; resolved: plain `plocate` pattern only until regex proves necessary.
-- Elevated access could use a helper binary, root SSH, or direct sudo; resolved: no helper or root account, use direct fixed sudo commands only after `sudo -n -l` confirms access.
-- Elevated tools could blindly try sudo first; resolved: check `sudo -n -l` first because failed sudo commands can notify admins.
+- [ADR 0001](docs/adr/0001-use-explicit-sshro-tool-names.md): explicit SSH tool names
+- [ADR 0003](docs/adr/0003-agent-connect-with-whitelist-and-approval.md): exact-target approval
+- [ADR 0004](docs/adr/0004-load-ssh-inspection-tools-after-target-approval.md): lazy Inspection Tool Suite activation
+- [ADR 0005](docs/adr/0005-preserve-target-approval-across-hot-reload.md): approval lifecycle across reload and replacement
