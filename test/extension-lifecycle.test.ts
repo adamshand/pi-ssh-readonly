@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { localSshFixture } from "./helpers/local-ssh.ts";
+import { DENIED_PATH_PARTS } from "../src/path-policy.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import sshReadonlyExtension from "../index.ts";
 import type { SshExecResult, SshExecutor } from "../src/ssh-transport.ts";
@@ -114,6 +118,108 @@ function sshResult(overrides: Partial<SshExecResult>): SshExecResult {
 		...overrides,
 	};
 }
+
+test("recursive grep enforces credential path policy below an allowed parent", async () => {
+	const fixture = await localSshFixture();
+	try {
+		const files = [...DENIED_PATH_PARTS.map((path) => `${path.slice(1)}/private-data`), ".ssh/config", ".env", "app.env", ".npmrc"];
+		const root = join(fixture.dir, "data");
+		for (const file of [...files, "allowed.txt"]) {
+			const path = join(root, file);
+			await mkdir(dirname(path), { recursive: true });
+			await writeFile(path, file === "allowed.txt" ? "MATCH public\n" : "MATCH PRIVATE_TEST_SECRET\n");
+		}
+		const pi = new FakePi();
+		sshReadonlyExtension(pi.api(), { sshExecutor: fixture.execute });
+		await pi.runCommand("fixture");
+		const result = await pi.runTool("sshro_grep", { target: "fixture", path: root, pattern: "MATCH", literal: true });
+		assert.match(result.content[0].text, /MATCH public/);
+		assert.doesNotMatch(result.content[0].text, /PRIVATE_TEST_SECRET/);
+		await writeFile(join(root, "allowed.txt"), "MATCH public\n".repeat(3));
+		const limited = await pi.runTool("sshro_grep", { target: "fixture", path: root, pattern: "MATCH", literal: true, limit: 1 });
+		assert.match(limited.content[0].text, /showing 1 of 3 lines/);
+	} finally {
+		await fixture.close();
+	}
+});
+
+test("inspection operands cannot select command options or other hosts", async () => {
+	let executions = 0;
+	const pi = new FakePi();
+	sshReadonlyExtension(pi.api(), { sshExecutor: async () => { executions++; return sshResult({}); } });
+	await pi.runCommand("fixture");
+	for (const [tool, params] of [
+		["sshro_dig", { name: "-f/tmp/batch" }],
+		["sshro_dig", { name: "+trace" }],
+		["sshro_dig", { name: "@other-server" }],
+		["sshro_dig", { name: "example.test", server: "@other-server" }],
+		["sshro_systemctl", { action: "status", unit: "--host=root@other-server" }],
+		["sshro_systemctl", { action: "show", unit: "-Hother-server" }],
+		["sshro_docker_inspect", { object: "--format={{json .}}" }],
+		["sshro_docker_stats", { container: "--no-stream=false" }],
+	] as const) {
+		await assert.rejects(pi.runTool(tool, { target: "fixture", ...params }), /option|operand|name|server|unit|object|container/);
+	}
+	assert.equal(executions, 0);
+});
+
+test("Docker inspect never exposes raw secrets when parsing or execution fails", async () => {
+	for (const response of [
+		sshResult({ stdout: '{"Config":{"Env":["PRIVATE_TEST_SECRET"]}} broken-json' }),
+		sshResult({ stdout: '{"Config":{"Env":["PRIVATE_TEST_SECRET"]}}', stdoutTruncated: true }),
+		sshResult({ code: 1, stdout: "PRIVATE_TEST_SECRET", stderr: "PRIVATE_TEST_SECRET" }),
+	]) {
+		const pi = new FakePi();
+		sshReadonlyExtension(pi.api(), { sshExecutor: async () => response });
+		await pi.runCommand("fixture");
+		await assert.rejects(pi.runTool("sshro_docker_inspect", { target: "fixture", object: "app" }), (error: Error) => {
+			assert.doesNotMatch(error.message, /PRIVATE_TEST_SECRET/);
+			return true;
+		});
+	}
+});
+
+test("valid Docker inspect output retains useful metadata but redacts secrets", async () => {
+	const pi = new FakePi();
+	sshReadonlyExtension(pi.api(), { sshExecutor: async () => sshResult({ stdout: JSON.stringify([{
+		Name: "app", Config: { Env: ["PRIVATE_ENV_SECRET"], Labels: { token: "PRIVATE_LABEL_SECRET", project: "public" } },
+		GraphDriver: { Name: "overlay2", Data: { Secret: "PRIVATE_DRIVER_SECRET" } },
+	}]) }) });
+	await pi.runCommand("fixture");
+	const result = await pi.runTool("sshro_docker_inspect", { target: "fixture", object: "app" });
+	assert.match(result.content[0].text, /public/);
+	assert.match(result.content[0].text, /\[redacted\]/);
+	assert.match(result.content[0].text, /overlay2/);
+	assert.doesNotMatch(result.content[0].text, /PRIVATE_/);
+});
+
+test("reload never falls back to older grants when the newest snapshot is malformed", async () => {
+	for (const data of [null, { version: 2, targets: [] }, { version: 1, targets: [42], writeTargets: [] }, { version: 1, targets: [], writeTargets: [42] }, { version: 1, writeTargets: [] }]) {
+		const pi = new FakePi({ entries: [
+			{ type: "custom", customType: "sshro-approval-state", data: { version: 1, targets: ["old"], toolsActive: true, writeTargets: ["old"] } },
+			{ type: "custom", customType: "sshro-approval-state", data },
+		] });
+		sshReadonlyExtension(pi.api());
+		await pi.emit("session_start", { reason: "reload" });
+		assert.ok(!pi.active.includes("ssh_exec"));
+		assert.ok(!pi.active.includes("sshro_read"));
+		await assert.rejects(pi.runTool("ssh_exec", { target: "old", command: "id" }), /No write grant/);
+	}
+});
+
+test("all Docker output paths are bounded, including oversized rows and failures", async () => {
+	for (const code of [0, 1]) {
+		const pi = new FakePi();
+		sshReadonlyExtension(pi.api(), { sshExecutor: async () => sshResult({ code, stdout: "ID COMMAND\nabc " + "x".repeat(100000) }) });
+		await pi.runCommand("fixture");
+		let text: string;
+		try { text = (await pi.runTool("sshro_docker_ps", { target: "fixture" })).content[0].text; }
+		catch (error) { text = (error as Error).message; }
+		assert.ok(Buffer.byteLength(text) <= 51200);
+		assert.match(text, /truncated/);
+		assert.match(text, /ssh-ro: fixture/);
+	}
+});
 
 test("ssh_exec renders its target and multiline command above the default output", () => {
 	const pi = new FakePi();

@@ -1,6 +1,6 @@
 # SSH Read-only Extension
 
-This context covers a pi extension that lets agents inspect remote Linux servers over SSH without exposing remote mutation capabilities.
+This context covers a pi extension for inspecting remote Linux servers safely by default, with separately human-granted unrestricted access for selected targets.
 
 ## Language
 
@@ -17,12 +17,20 @@ The detailed collection of SSH Read-only Tools made available on demand after a 
 _Avoid_: remote mode, implicit-target tools
 
 **Exact Target**:
-The literal single-argument OpenSSH destination string supplied to a tool, such as `server` or `user@server`. Distinct strings remain distinct even if OpenSSH resolves them to the same host. Option-shaped, whitespace-containing, control-character, path-suffixed, and IPv6 values are rejected in v1.
+The literal single-argument OpenSSH destination string supplied to a tool, such as `server` or `user@server`. Distinct strings remain distinct even if OpenSSH resolves them to the same host.
 _Avoid_: canonical host, active host
 
 **Target Approval**:
 Human consent for the agent to use one Exact Target during the current Pi session. Approval authorizes the fixed Inspection Tool Suite, not arbitrary remote execution.
 _Avoid_: connection approval, host trust, unrestricted SSH access
+
+**Write Grant**:
+Separately confirmed human consent for unrestricted execution on one Exact Target for the current session. A Write Grant is not implied by Target Approval or the SSHRO Host Whitelist.
+_Avoid_: whitelist exception, read-write mode, permanent trust
+
+**Unrestricted SSH Tool**:
+The separately enabled capability to execute arbitrary remote commands under a Write Grant, without read-only path restrictions or secret redaction.
+_Avoid_: read-only shell, bash guard bypass
 
 **SSHRO Host Whitelist**:
 A configured set of Exact Targets that may receive Target Approval automatically.
@@ -33,7 +41,7 @@ A literal alias discovered from trusted local SSH configuration and shown to the
 _Avoid_: approved alias, whitelisted host
 
 **Fixed Remote Command Template**:
-A known read-only command shape whose variable values are validated and shell-quoted.
+A known read-only command shape whose variable values are validated as operands and shell-quoted.
 _Avoid_: arbitrary remote shell, user-authored command
 
 **Canonical Remote Path**:
@@ -47,24 +55,3 @@ _Avoid_: blind sudo attempt, password prompt, privileged shell
 **Visible Search Errors**:
 Search diagnostics that let the agent distinguish no evidence from inaccessible evidence.
 _Avoid_: hidden permission errors, silent traversal failure
-
-## Invariants and relationships
-
-- `sshro_connect` is the only SSH read-only tool active initially. It approves or discovers an Exact Target and additively enables the Inspection Tool Suite; it does not open a network connection.
-- Every Inspection Tool remains target-explicit. There is no hidden active host or remote-only mode, and unrelated local/extension tools remain available.
-- Suggested Targets come only from bounded parsing of trusted local SSH configuration. Suggestions never extend the SSHRO Host Whitelist and become approved only through a human action.
-- Automatic approval compares validated Exact Targets literally. Human approval is branch-independent process-memory state for the current Pi session, survives hot reload through the latest versioned non-context session snapshot, and does not cross process restart or session replacement.
-- `--ssh-ro` applies only at initial process startup. `/sshro logout` remains effective across later hot reloads.
-- Pending approval results are generation-bound: logout or shutdown invalidates stale confirmations before they can mutate approval state.
-- OpenSSH receives an option terminator before the Exact Target. Remote command discovery is cached only after the remote wrapper completes, so transport failure remains visible and retryable.
-- Existing content paths are checked lexically and again as Canonical Remote Paths. This blocks ordinary symlink bypasses but does not eliminate remote time-of-check/time-of-use races.
-- Producer status is carried outside remote filters. Expected no-match/inactive states and intentional bounded-read SIGPIPE are informative success; other failures are Pi tool errors.
-- “Read-only” describes the capabilities offered by this extension, not zero observable writes: SSH/audit logs, access times, DNS queries, shell startup hooks, and remote binaries can have side effects.
-- The agent bash guard is an accidental-use tripwire, not a process/network sandbox. Git-over-SSH, including mutation by push, remains intentionally allowed.
-
-## Decision index
-
-- [ADR 0001](docs/adr/0001-use-explicit-sshro-tool-names.md): explicit SSH tool names
-- [ADR 0003](docs/adr/0003-agent-connect-with-whitelist-and-approval.md): exact-target approval
-- [ADR 0004](docs/adr/0004-load-ssh-inspection-tools-after-target-approval.md): lazy Inspection Tool Suite activation
-- [ADR 0005](docs/adr/0005-preserve-target-approval-across-hot-reload.md): approval lifecycle across reload and replacement

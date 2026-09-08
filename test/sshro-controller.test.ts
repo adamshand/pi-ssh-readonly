@@ -5,7 +5,6 @@ import { SshRoController } from "../src/sshro-controller.ts";
 function harness(options: { whitelist?: string[]; blocked?: string[]; confirm?: () => Promise<boolean> } = {}) {
 	let active = ["read", "sshro_connect"];
 	let confirmCalls = 0;
-	const persisted: string[][] = [];
 	const controller = new SshRoController({
 		pi: {
 			getActiveTools: () => [...active],
@@ -14,10 +13,6 @@ function harness(options: { whitelist?: string[]; blocked?: string[]; confirm?: 
 			},
 		},
 		whitelistedTargets: () => new Set(options.whitelist ?? []),
-		validateTarget: (target) => {
-			if (!target || target.includes(":")) throw new Error("invalid target");
-		},
-		onApprovalsChanged: (targets) => persisted.push(targets),
 	});
 	controller.setInspectionToolNames(["sshro_read", "sshro_ls"]);
 	const context = {
@@ -29,7 +24,7 @@ function harness(options: { whitelist?: string[]; blocked?: string[]; confirm?: 
 			},
 		},
 	};
-	return { controller, context, active: () => active, confirmCalls: () => confirmCalls, persisted };
+	return { controller, context, active: () => active, confirmCalls: () => confirmCalls };
 }
 
 test("whitelisted targets authorize without prompting", async () => {
@@ -39,7 +34,7 @@ test("whitelisted targets authorize without prompting", async () => {
 	assert.deepEqual(h.controller.availableTargets(), ["prod"]);
 });
 
-test("accepted exact-target approval is persisted and shared by concurrent requests", async () => {
+test("accepted exact-target approval is remembered and shared by concurrent requests", async () => {
 	let release!: (approved: boolean) => void;
 	const approval = new Promise<boolean>((resolve) => { release = resolve; });
 	const h = harness({ confirm: () => approval });
@@ -49,7 +44,6 @@ test("accepted exact-target approval is persisted and shared by concurrent reque
 	release(true);
 	assert.deepEqual(await Promise.all([first, second]), ["user@prod", "user@prod"]);
 	assert.deepEqual(h.controller.approved(), ["user@prod"]);
-	assert.deepEqual(h.persisted, [["user@prod"]]);
 });
 
 test("clearing approvals invalidates an already pending confirmation", async () => {
@@ -86,7 +80,7 @@ test("approval restoration is atomic and cache clearing is explicit", () => {
 	const h = harness();
 	h.controller.restoreApprovals(["b", "a"]);
 	assert.deepEqual(h.controller.approved(), ["a", "b"]);
-	assert.throws(() => h.controller.restoreApprovals(["valid", "invalid:target"]), /invalid target/);
+	assert.throws(() => h.controller.restoreApprovals(["valid", "invalid:target"]), /SSH.*target/);
 	assert.deepEqual(h.controller.approved(), ["a", "b"]);
 	h.controller.cacheRemoteCommand("key", "/usr/bin/cat");
 	h.controller.cacheSudoCheck("sudo", { allowed: true, reason: "ok" });

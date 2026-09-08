@@ -1,20 +1,21 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
-	formatSize,
-	truncateHead,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import Type, { type TSchema } from "typebox";
+import { approvalSnapshot, latestPersistedApprovalState, SSHRO_APPROVAL_STATE_ENTRY } from "./src/session-state.ts";
+import { registerUnrestrictedExec } from "./src/unrestricted-exec.ts";
+import { errorResult, textResult, truncateText } from "./src/tool-result.ts";
+import { commandString, systemctlArgs, validateDnsOperand, validateOperand } from "./src/inspection-command.ts";
 import { bashSshBlockReason } from "./src/bash-ssh-guard.ts";
 import { boundedReadFailed, grepFailed, locateFailed, systemctlFailed } from "./src/exit-policy.ts";
 import { discoverSshConfigAliases } from "./src/ssh-config.ts";
 import { resolveRemoteCommandCached } from "./src/remote-command.ts";
-import { statusPreservingPipeline } from "./src/ssh-output.ts";
+import { boundedLineFilter, statusPreservingPipeline, type PipelineFilter } from "./src/ssh-output.ts";
 import {
 	captureTruncationNote,
 	requireCompleteCapture,
@@ -23,13 +24,10 @@ import {
 	sshExec,
 	type SshExecutor,
 } from "./src/ssh-transport.ts";
-import { normalizeSshTarget, parseSshTargetList } from "./src/target-policy.ts";
+import { parseSshTargetList } from "./src/target-policy.ts";
 import {
 	canonicalPathForPolicy,
-	DENIED_DIR_NAMES,
-	DENIED_FILE_NAMES,
-	DENIED_FILE_PREFIXES,
-	DENIED_FILE_SUFFIXES,
+	recursiveGrepPolicyArgs,
 	denyReasonForPath,
 	joinRemotePath,
 	remotePath,
@@ -40,14 +38,8 @@ import { SSHRO_CONNECT_TOOL_NAME } from "./src/tool-activation.ts";
 
 const SSHRO_HOST_WHITELIST_ENV = "SSHRO_HOST_WHITELIST";
 const DEFAULT_LINE_LIMIT = DEFAULT_MAX_LINES;
-const DEFAULT_BYTE_LIMIT = DEFAULT_MAX_BYTES;
-const SSHRO_APPROVAL_STATE_ENTRY = "sshro-approval-state";
 const SSHRO_STATUS_KEY = "sshro";
 const MAX_DISCOVERED_TARGETS = 100;
-
-function validateTarget(target: string): void {
-	normalizeSshTarget(target);
-}
 
 function whitelistConfig() {
 	return parseSshTargetList(process.env[SSHRO_HOST_WHITELIST_ENV]);
@@ -68,19 +60,8 @@ function whitelistedHostsPromptHint(): string {
 	return `SSH connection requests require approval unless the target is on the whitelist. For automatic approval, use the target exactly as listed.\n\nWhitelist: ${list}.${invalidNote}`;
 }
 
-function truncateText(text: string, maxLines = DEFAULT_LINE_LIMIT, maxBytes = DEFAULT_BYTE_LIMIT): string {
-	const truncation = truncateHead(text, { maxLines, maxBytes });
-	if (!truncation.truncated) return truncation.content;
-	return `${truncation.content}\n\n[ssh-ro output truncated: ${truncation.outputLines}/${truncation.totalLines} lines, ${formatSize(truncation.outputBytes)}/${formatSize(truncation.totalBytes)}]`;
-}
-
-
 function targetParam() {
 	return Type.String({ description: `SSH target to connect to, e.g. user@host or an OpenSSH Host alias. Must match whitelist entries exactly for automatic approval. ${whitelistedHostsPromptHint()}` });
-}
-
-function commandString(commandPath: string, args: string[]): string {
-	return [commandPath, ...args].map(shellQuote).join(" ");
 }
 
 function sudoSetupHint(commandPath: string, argsHint = "*"): string {
@@ -117,16 +98,13 @@ function sudoMeta(usedSudo: boolean, sudoReason: string): string {
 	return "sudo: no (not allowed)";
 }
 
-function remoteMetaFooter(target: string, remoteTime?: string, sudo?: string): string {
-	return `[ssh-ro: ${[target, sudo, remoteTime ? `remote time: ${remoteTime}` : undefined].filter(Boolean).join(" | ")}]`;
-}
-
 function appendRemoteMeta(output: string, target: string, remoteTime?: string, sudo?: string): string {
-	return `${output.trimEnd()}\n\n${remoteMetaFooter(target, remoteTime, sudo)}`;
+	const meta = [target, sudo, remoteTime ? `remote time: ${remoteTime}` : undefined].filter(Boolean).join(" | ");
+	return `${output.trimEnd()}\n\n[ssh-ro: ${meta}]`;
 }
 
-function appendSudoNote(output: string, usedSudo: boolean, sudoReason: string, target?: string, remoteTime?: string): string {
-	return target ? appendRemoteMeta(output, target, remoteTime, sudoMeta(usedSudo, sudoReason)) : `${output.trimEnd()}\n\n[ssh-ro: ${sudoMeta(usedSudo, sudoReason)}]`;
+function appendSudoNote(output: string, usedSudo: boolean, sudoReason: string, target: string, remoteTime?: string): string {
+	return appendRemoteMeta(output, target, remoteTime, sudoMeta(usedSudo, sudoReason));
 }
 
 function isAllowedTextMime(mime: string): boolean {
@@ -135,15 +113,6 @@ function isAllowedTextMime(mime: string): boolean {
 
 function permissionDenied(text: string): boolean {
 	return /permission denied|operation not permitted/i.test(text);
-}
-
-function textResult(text: string, failed = false) {
-	if (failed) throw new Error(text);
-	return { content: [{ type: "text" as const, text }], details: {} };
-}
-
-function errorResult(err: unknown): never {
-	throw err instanceof Error ? err : new Error(String(err));
 }
 
 function optionalString(value: unknown): string | undefined {
@@ -211,10 +180,6 @@ const DOCKER_KINDS = ["container", "image", "network", "volume"] as const;
 const DNS_TYPES = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "PTR", "CAA", "SRV"] as const;
 const SENSITIVE_LABEL_KEY_RE = /(token|secret|password|passwd|key|credential|creds)/i;
 
-function validateDockerRef(value: string, label: string): void {
-	validatePathLike(value, label);
-}
-
 function validatePositiveLimit(value: unknown, label: string, defaultValue: number): number {
 	const limit = value === undefined ? defaultValue : Math.floor(Number(value));
 	if (!Number.isFinite(limit) || limit < 1) throw new Error(`${label} must be >= 1`);
@@ -229,13 +194,9 @@ function parseNdjson(output: string): unknown[] {
 		.map((line) => JSON.parse(line));
 }
 
-function prettyJson(value: unknown, maxLines = DEFAULT_LINE_LIMIT): string {
-	return truncateText(JSON.stringify(value, null, 2), maxLines);
-}
-
 function prettyJsonRows(rows: unknown[], limit: number, label: string): string {
 	const sliced = rows.slice(0, limit);
-	let output = prettyJson(sliced);
+	let output = JSON.stringify(sliced, null, 2);
 	if (rows.length > limit) output += `\n\n[ssh-ro output truncated to ${limit} ${label}]`;
 	return output;
 }
@@ -294,13 +255,7 @@ function redactDockerEnvs(value: unknown): unknown {
 	return out;
 }
 
-function curateDockerInspect(items: unknown[]): unknown {
-	return items.map(redactDockerEnvs);
-}
-
-
-function registerSshRoTools(pi: ExtensionAPI, controller: SshRoController, executeSsh: SshExecutor, onStateChanged: (ctx: ExtensionContext) => void): string[] {
-	const sshExec = executeSsh;
+function registerSshRoTools(pi: ExtensionAPI, controller: SshRoController, sshExec: SshExecutor, onStateChanged: (ctx: ExtensionContext) => void): void {
 	const inspectionToolNames: string[] = [];
 	const registerInspectionTool = <TParams extends TSchema, TDetails = unknown, TState = unknown>(definition: ToolDefinition<TParams, TDetails, TState>) => {
 		inspectionToolNames.push(definition.name);
@@ -311,8 +266,8 @@ function registerSshRoTools(pi: ExtensionAPI, controller: SshRoController, execu
 		onStateChanged(ctx);
 		return authorized;
 	};
-	const resolveRemoteCommand = (target: string, command: string, signal?: AbortSignal) => resolveRemoteCommandCached(controller, executeSsh, target, command, signal);
-	const chooseCommand = (target: string, command: string, args: string[], signal?: AbortSignal) => chooseRemoteCommand(controller, executeSsh, target, command, args, signal);
+	const resolveRemoteCommand = (target: string, command: string, signal?: AbortSignal) => resolveRemoteCommandCached(controller, sshExec, target, command, signal);
+	const chooseCommand = (target: string, command: string, args: string[], signal?: AbortSignal) => chooseRemoteCommand(controller, sshExec, target, command, args, signal);
 	const canonicalRemotePath = async (target: string, input: string | undefined, signal?: AbortSignal) => {
 		const lexicalPath = remotePath(input, ".");
 		return canonicalPathForPolicy(lexicalPath, async (path) => {
@@ -449,7 +404,7 @@ function registerSshRoTools(pi: ExtensionAPI, controller: SshRoController, execu
 	const digParams = Type.Object({
 		target: targetParam(),
 		name: Type.String({ description: "DNS name or address to query" }),
-		type: Type.Optional(StringEnum(["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "PTR", "CAA", "SRV"] as const, { description: "DNS record type, default A" })),
+		type: Type.Optional(StringEnum(DNS_TYPES, { description: "DNS record type, default A" })),
 		server: Type.Optional(Type.String({ description: "Optional DNS server, e.g. 1.1.1.1 or dns.example.com" })),
 		short: Type.Optional(Type.Boolean({ description: "Use dig +short output, default false" })),
 	});
@@ -470,15 +425,13 @@ function registerSshRoTools(pi: ExtensionAPI, controller: SshRoController, execu
 				const limit = validatePositiveLimit(params.limit, "limit", DEFAULT_LINE_LIMIT);
 				const rangeLabel = offset < 0 ? `last ${Math.abs(offset)} lines${params.limit !== undefined ? `, limited to ${limit}` : ""}` : `${offset}-${offset + limit - 1}`;
 				const read = await chooseCommand(target, "cat", ["--", p], signal);
-				const mimeCheck = await sshExec(target, statusPreservingPipeline(`${read.command} 2>/dev/null`, "head -c 4096 | file --mime-type -b -"), signal, 15_000);
+				const mimeCheck = await sshExec(target, statusPreservingPipeline(`${read.command} 2>/dev/null`, ["head -c 4096", "file --mime-type -b -"]), signal, 15_000);
 				if (boundedReadFailed(mimeCheck.code)) throw new Error(`unable to sample file for MIME detection: ${(mimeCheck.stderr || mimeCheck.stdout).trim()}`);
 				const mime = mimeCheck.stdout.trim().split(/\r?\n/, 1)[0] || "unknown";
 				if (!isAllowedTextMime(mime)) throw new Error(`refusing non-text file (${mime}): ${p}`);
 				const slice = offset < 0
-					? `tail -n ${Math.abs(offset)}${params.limit !== undefined ? ` | head -n ${limit}` : ""}`
-					: offset === 1
-						? `head -n ${limit}`
-						: `tail -n +${offset} | head -n ${limit}`;
+					? [`tail -n ${Math.abs(offset)}`, ...(params.limit !== undefined ? [`head -n ${limit}`] : [])]
+					: offset === 1 ? [`head -n ${limit}`] : [`tail -n +${offset}`, `head -n ${limit}`];
 				const script = `printf 'path: %s\nmime: %s\nlines: %s\n---\n' ${shellQuote(p)} ${shellQuote(mime)} ${shellQuote(rangeLabel)}; ${statusPreservingPipeline(read.command, slice)}`;
 				const r = await sshExec(target, script, signal);
 				let output = r.stdout;
@@ -489,7 +442,7 @@ ${r.stderr}`;
 				if (failed && permissionDenied(output) && !read.usedSudo) output += `
 
 ${sudoSetupHint(read.commandPath)}`;
-				return textResult(appendSudoNote(truncateText(output) + captureTruncationNote(r), read.usedSudo, read.sudoReason, target, r.remoteTime), failed);
+				return textResult(appendSudoNote(output + captureTruncationNote(r), read.usedSudo, read.sudoReason, target, r.remoteTime), failed);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -515,8 +468,9 @@ ${sudoSetupHint(read.commandPath)}`;
 				const commandName = ezaPath ? "eza" : "ls";
 				const args = ezaPath ? ["-1l", "--absolute=on", "-R", "--color=never", "--icons=never", "--", p] : [recursive ? "-laR" : "-la", "--", p];
 				const chosen = await chooseCommand(target, commandName, args, signal);
-				const filter = ezaPath ? "grep -Ev '^(/|$)'" : "cat";
-				const r = await sshExec(target, statusPreservingPipeline(`LC_ALL=C ${chosen.command}`, `${filter} | sed -n '1,${limit}p'`), signal, recursive ? 45_000 : 30_000);
+				const filters: PipelineFilter[] = ezaPath ? [{ command: "grep -Ev '^(/|$)'", allowNoMatch: true }] : [];
+				filters.push(boundedLineFilter(limit));
+				const r = await sshExec(target, statusPreservingPipeline(`LC_ALL=C ${chosen.command}`, filters), signal, recursive ? 45_000 : 30_000);
 				const stdout = r.code === 0 ? (recursive ? markBlockedRecursiveLsEntries(r.stdout) : markBlockedLsEntries(r.stdout, p)) : r.stdout;
 				let combined = `${stdout}${r.stderr ? `
 [stderr]
@@ -525,7 +479,7 @@ ${r.stderr}` : ""}`;
 				if (failed && permissionDenied(combined) && !chosen.usedSudo) combined += `
 
 ${sudoSetupHint(chosen.commandPath, ezaPath ? "-1l --absolute=on -R --color=never --icons=never -- *" : "*")}`;
-				return textResult(appendSudoNote(truncateText(combined, limit) + captureTruncationNote(r), chosen.usedSudo, chosen.sudoReason, target, r.remoteTime), failed);
+				return textResult(appendSudoNote(combined + captureTruncationNote(r), chosen.usedSudo, chosen.sudoReason, target, r.remoteTime), failed);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -547,7 +501,7 @@ ${sudoSetupHint(chosen.commandPath, ezaPath ? "-1l --absolute=on -R --color=neve
 				validatePathLike(params.pattern, "pattern");
 				const limit = validatePositiveLimit(params.limit, "limit", 500);
 				const locate = await chooseCommand(target, "plocate", ["--", params.pattern], signal);
-				const r = await sshExec(target, statusPreservingPipeline(locate.command, `sed -n '1,${limit}p'`), signal, 20_000);
+				const r = await sshExec(target, statusPreservingPipeline(locate.command, boundedLineFilter(limit)), signal, 20_000);
 				let output = r.stdout.trim().length ? r.stdout : "No matches";
 				if (r.stderr) output += `
 [stderr]
@@ -559,7 +513,7 @@ ${output}`;
 
 ${sudoSetupHint(locate.commandPath)}`;
 				const failed = locateFailed(r.code, r.stderr);
-				return textResult(appendSudoNote(truncateText(output, limit) + captureTruncationNote(r), locate.usedSudo, locate.sudoReason, target, r.remoteTime), failed);
+				return textResult(appendSudoNote(output + captureTruncationNote(r), locate.usedSudo, locate.sudoReason, target, r.remoteTime), failed);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -594,16 +548,13 @@ ${sudoSetupHint(locate.commandPath)}`;
 				if (test.code === 0) {
 					grepArgs.push("-r");
 					if (params.glob) grepArgs.push(`--include=${params.glob}`);
-					for (const dir of [...DENIED_DIR_NAMES, ".git", "node_modules"]) grepArgs.push(`--exclude-dir=${dir}`);
-					for (const name of DENIED_FILE_NAMES) grepArgs.push(`--exclude=${name}`);
-					for (const prefix of DENIED_FILE_PREFIXES) grepArgs.push(`--exclude=${prefix}*`);
-					for (const suffix of DENIED_FILE_SUFFIXES) grepArgs.push(`--exclude=*${suffix}`);
+					grepArgs.push(...recursiveGrepPolicyArgs());
 				}
 				grepArgs.push("--", params.pattern, base);
 				const grep = await chooseCommand(target, "grep", grepArgs, signal);
-				const r = await sshExec(target, statusPreservingPipeline(grep.command, `sed -n '1,${limit}p'`), signal, 60_000);
+				const r = await sshExec(target, statusPreservingPipeline(grep.command, boundedLineFilter(limit)), signal, 60_000);
 				const failed = grepFailed(r.code);
-				let output = r.stdout.trim().length ? truncateText(r.stdout, limit) : "No matches";
+				let output = r.stdout.trim().length ? r.stdout : "No matches";
 				if (failed && permissionDenied(r.stderr) && !grep.usedSudo) output += `
 
 ${sudoSetupHint(grep.commandPath)}`;
@@ -641,13 +592,15 @@ ${sudoSetupHint(grep.commandPath)}`;
 				if (grep) validatePathLike(grep, "grep");
 				const journalctl = await chooseCommand(target, "journalctl", args, signal);
 				const base = `${journalctl.command} 2>&1`;
-				const script = statusPreservingPipeline(base, grep ? `grep -i -- ${shellQuote(grep)} | sed -n '1,${lines}p'` : `sed -n '1,${lines}p'`);
+				const filters: PipelineFilter[] = grep ? [{ command: `grep -i -- ${shellQuote(grep)}`, allowNoMatch: true }] : [];
+				filters.push(boundedLineFilter(lines));
+				const script = statusPreservingPipeline(base, filters);
 				const r = await sshExec(target, script, signal, 45_000);
 				let output = r.stdout + r.stderr;
 				if (/not seeing messages from other users and the system/i.test(output) && !journalctl.usedSudo) output += `
 
 ${sudoSetupHint(journalctl.commandPath)}`;
-				return textResult(appendSudoNote((output.trim().length ? truncateText(output, lines) : "No journal output") + captureTruncationNote(r), journalctl.usedSudo, journalctl.sudoReason, target, r.remoteTime), r.code !== 0);
+				return textResult(appendSudoNote((output.trim().length ? output : "No journal output") + captureTruncationNote(r), journalctl.usedSudo, journalctl.sudoReason, target, r.remoteTime), r.code !== 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -668,18 +621,12 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 				const target = await authorizeTarget(params.target, ctx, signal);
 				const action = params.action;
 				const unit = optionalString(params.unit);
-				if ((action === "status" || action === "show") && !unit) throw new Error(`sshro_systemctl action '${action}' requires unit`);
-				if (unit) validatePathLike(unit, "unit");
-				let args: string[];
-				if (action === "failed") args = ["--no-pager", "--plain", "--failed"];
-				else if (action === "list") args = ["--no-pager", "--plain", "list-units", "--type=service", "--all"];
-				else if (action === "status") args = ["--no-pager", "status", unit!];
-				else args = ["show", unit!, "--property=Id,Names,Description,LoadState,ActiveState,SubState,UnitFileState,Result,ExecMainCode,ExecMainStatus,MainPID,FragmentPath,DropInPaths,Requires,Wants,After,Before,Restart,RestartUSec,StartLimitBurst,StartLimitIntervalUSec"];
+				const args = systemctlArgs(action, unit);
 				const systemctl = await chooseCommand(target, "systemctl", args, signal);
-				const r = await sshExec(target, statusPreservingPipeline(`${systemctl.command} 2>&1`, `sed -n '1,${DEFAULT_LINE_LIMIT}p'`), signal, 30_000);
+				const r = await sshExec(target, statusPreservingPipeline(`${systemctl.command} 2>&1`, boundedLineFilter(DEFAULT_LINE_LIMIT)), signal, 30_000);
 				const output = r.stdout + r.stderr;
 				const failed = systemctlFailed(action, r.code);
-				return textResult(appendSudoNote(truncateText(output || "No systemctl output") + captureTruncationNote(r), systemctl.usedSudo, systemctl.sudoReason, target, r.remoteTime), failed);
+				return textResult(appendSudoNote((output || "No systemctl output") + captureTruncationNote(r), systemctl.usedSudo, systemctl.sudoReason, target, r.remoteTime), failed);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -704,16 +651,16 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 				if (pattern) validatePathLike(pattern, "pattern");
 				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 80)));
 				const sort = params.sort === "mem" ? "--sort=-%mem" : params.sort === "pid" ? "--sort=pid" : "--sort=-%cpu";
-				const pipelineFilters: string[] = [];
+				const pipelineFilters: PipelineFilter[] = [];
 				if (user) pipelineFilters.push(`awk -v u=${shellQuote(user)} 'NR==1 || $3 == u'`);
-				if (pattern) pipelineFilters.push(`grep -i -- ${shellQuote(pattern)}`);
-				pipelineFilters.push(`sed -n '1,${limit}p'`);
-				const script = statusPreservingPipeline(`ps -eo pid,ppid,user,stat,etime,%cpu,%mem,args ${sort} 2>&1`, pipelineFilters.join(" | "));
+				if (pattern) pipelineFilters.push({ command: `grep -i -- ${shellQuote(pattern)}`, allowNoMatch: true });
+				pipelineFilters.push(boundedLineFilter(limit));
+				const script = statusPreservingPipeline(`ps -eo pid,ppid,user,stat,etime,%cpu,%mem,args ${sort} 2>&1`, pipelineFilters);
 				const r = await sshExec(target, script, signal, 20_000);
 				const output = r.stdout + r.stderr;
 				const noMatches = output.trim().length === 0 || psHasOnlyHeader(output);
 				const filterLabel = [user ? `user=${user}` : undefined, pattern ? `pattern=${pattern}` : undefined].filter(Boolean).join(" ");
-				return textResult(appendRemoteMeta((noMatches ? `No matching processes${filterLabel ? ` for ${filterLabel}` : ""}` : truncateText(output, limit)) + captureTruncationNote(r), target, r.remoteTime), r.code !== 0);
+				return textResult(appendRemoteMeta((noMatches ? `No matching processes${filterLabel ? ` for ${filterLabel}` : ""}` : output) + captureTruncationNote(r), target, r.remoteTime), r.code !== 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -737,7 +684,7 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 				const proto = includeTcp || includeUdp ? `${includeTcp ? "t" : ""}${includeUdp ? "u" : ""}` : "tu";
 				const flags = `-${proto}${params.listeningOnly === false ? "a" : "l"}n${params.processInfo ? "p" : ""}`;
 				const limit = Math.max(1, Math.min(DEFAULT_LINE_LIMIT, Math.floor(params.limit ?? 500)));
-				const script = `command -v ss >/dev/null 2>&1 || { echo 'ss not found on remote host' >&2; exit 127; }; ${statusPreservingPipeline(`ss ${flags} 2>&1`, `sed -n '1,${limit}p'`)}`;
+				const script = `command -v ss >/dev/null 2>&1 || { echo 'ss not found on remote host' >&2; exit 127; }; ${statusPreservingPipeline(`ss ${flags} 2>&1`, boundedLineFilter(limit))}`;
 				const r = await sshExec(target, script, signal, 20_000);
 				let output = r.stdout + r.stderr;
 				if (params.processInfo && output.trim().length > 0) {
@@ -745,7 +692,7 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 						? "\n[ssh-ro note] processInfo=true was requested; process ownership details may still be partial without elevated privileges.\n"
 						: "\n[ssh-ro note] processInfo=true was requested, but no process ownership details were visible. This usually means the SSH user lacks permission to inspect socket owners.\n";
 				}
-				return textResult(appendRemoteMeta((output.trim().length ? truncateText(output, limit) : "No socket output") + captureTruncationNote(r), target, r.remoteTime), r.code !== 0);
+				return textResult(appendRemoteMeta((output.trim().length ? output : "No socket output") + captureTruncationNote(r), target, r.remoteTime), r.code !== 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -769,10 +716,10 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 				const flags = ["-P"];
 				if (params.human !== false) flags.push("-h");
 				if (params.localOnly !== false) flags.push("-l");
-				const script = statusPreservingPipeline(`df ${flags.join(" ")}${resolvedPath ? ` ${shellQuote(resolvedPath)}` : ""} 2>&1`, `sed -n '1,${DEFAULT_LINE_LIMIT}p'`);
+				const script = statusPreservingPipeline(`df ${flags.join(" ")}${resolvedPath ? ` -- ${shellQuote(resolvedPath)}` : ""} 2>&1`, boundedLineFilter(DEFAULT_LINE_LIMIT));
 				const r = await sshExec(target, script, signal, 15_000);
 				const output = r.stdout + r.stderr;
-				return textResult(appendRemoteMeta((output.trim().length ? truncateText(output) : "No df output") + captureTruncationNote(r), target, r.remoteTime), r.code !== 0);
+				return textResult(appendRemoteMeta((output.trim().length ? output : "No df output") + captureTruncationNote(r), target, r.remoteTime), r.code !== 0);
 			} catch (err) {
 				return errorResult(err);
 			}
@@ -793,7 +740,7 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 				const target = await authorizeTarget(params.target, ctx, signal);
 				const limit = validatePositiveLimit(params.limit, "limit", 100);
 				const name = optionalString(params.name);
-				if (name) validateDockerRef(name, "name");
+				if (name) validatePathLike(name, "name");
 				const args = [params.all ? "--all" : "", "--no-trunc"].filter(Boolean);
 				if (name) args.push("--filter", shellQuote(`name=${name}`));
 				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker ps ${args.join(" ")}`;
@@ -821,20 +768,20 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
 				const target = await authorizeTarget(params.target, ctx, signal);
-				validateDockerRef(params.object, "object");
+				validateOperand(params.object, "object");
 				const kind = optionalString(params.kind);
 				if (kind && !(DOCKER_KINDS as readonly string[]).includes(kind)) throw new Error(`kind must be one of: ${DOCKER_KINDS.join(", ")}`);
-				const args = kind ? [`--type`, shellQuote(kind), shellQuote(params.object)] : [shellQuote(params.object)];
+				const args = [...(kind ? ["--type", shellQuote(kind)] : []), "--", shellQuote(params.object)];
 				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker inspect ${args.join(" ")}`;
 				const r = await sshExec(target, script, signal, 20_000);
-				if (r.code !== 0) return textResult(appendRemoteMeta(`docker inspect failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, target, r.remoteTime), true);
+				if (r.code !== 0) return textResult(appendRemoteMeta(`docker inspect failed (exit ${r.code ?? "unknown"}); raw output withheld because it may contain secrets.`, target, r.remoteTime), true);
 				requireCompleteCapture(r, "docker inspect");
 				try {
 					const parsed = JSON.parse(r.stdout);
-					const output = curateDockerInspect(Array.isArray(parsed) ? parsed : [parsed]);
-					return textResult(appendRemoteMeta(prettyJson(output), target, r.remoteTime));
-				} catch (err) {
-					return textResult(appendRemoteMeta(`docker inspect JSON output was unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, target, r.remoteTime), true);
+					const output = redactDockerEnvs(Array.isArray(parsed) ? parsed : [parsed]);
+					return textResult(appendRemoteMeta(JSON.stringify(output, null, 2), target, r.remoteTime));
+				} catch {
+					return textResult(appendRemoteMeta("docker inspect output could not be safely parsed/redacted; raw output and parser diagnostics withheld because they may contain secrets.", target, r.remoteTime), true);
 				}
 			} catch (err) {
 				return errorResult(err);
@@ -856,8 +803,8 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 				const target = await authorizeTarget(params.target, ctx, signal);
 				const limit = validatePositiveLimit(params.limit, "limit", 100);
 				const container = optionalString(params.container);
-				if (container) validateDockerRef(container, "container");
-				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker stats --no-stream --format '{{json .}}'${container ? ` ${shellQuote(container)}` : ""}`;
+				if (container) validateOperand(container, "container");
+				const script = `command -v docker >/dev/null 2>&1 || { echo 'docker not found on remote host' >&2; exit 127; }; docker stats --no-stream --format '{{json .}}'${container ? ` -- ${shellQuote(container)}` : ""}`;
 				const r = await sshExec(target, script, signal, 20_000);
 				if (r.code !== 0) return textResult(appendRemoteMeta(`docker stats failed: ${dockerUnavailableMessage(r.stderr, r.stdout)}`, target, r.remoteTime), true);
 				requireCompleteCapture(r, "docker stats");
@@ -865,7 +812,7 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 					const rows = parseNdjson(r.stdout);
 					return textResult(appendRemoteMeta(prettyJsonRows(rows, limit, "stat rows"), target, r.remoteTime));
 				} catch (err) {
-					return textResult(appendRemoteMeta(`docker stats JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${truncateText(r.stdout + r.stderr)}`, target, r.remoteTime), true);
+					return textResult(appendRemoteMeta(`docker stats JSON output was unavailable or unparseable: ${err instanceof Error ? err.message : String(err)}\n\n${r.stdout + r.stderr}`, target, r.remoteTime), true);
 				}
 			} catch (err) {
 				return errorResult(err);
@@ -887,12 +834,12 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 				const target = await authorizeTarget(params.target, ctx, signal);
 				const name = optionalString(params.name);
 				if (!name) throw new Error("name is required");
-				validatePathLike(name, "name");
+				validateDnsOperand(name, "name");
 				const type = optionalString(params.type) ?? "A";
 				if (!(DNS_TYPES as readonly string[]).includes(type)) throw new Error(`type must be one of: ${DNS_TYPES.join(", ")}`);
 				const server = optionalString(params.server);
-				if (server) validatePathLike(server, "server");
-				const args = ["+time=3", "+tries=1", params.short ? "+short" : "", server ? shellQuote(`@${server}`) : "", shellQuote(name), shellQuote(type)].filter(Boolean);
+				if (server) validateDnsOperand(server, "server");
+				const args = ["+time=3", "+tries=1", params.short ? "+short" : "", server ? shellQuote(`@${server}`) : "", "-q", shellQuote(name), "-t", shellQuote(type)].filter(Boolean);
 				const script = `command -v dig >/dev/null 2>&1 || { echo 'dig not found on remote host' >&2; exit 127; }; dig ${args.join(" ")}`;
 				const r = await sshExec(target, script, signal, 10_000);
 				const output = r.stdout + r.stderr;
@@ -907,33 +854,6 @@ ${sudoSetupHint(journalctl.commandPath)}`;
 	});
 
 	controller.setInspectionToolNames(inspectionToolNames);
-	return inspectionToolNames;
-}
-
-type PersistedApprovalState = { version: 1; targets: string[]; toolsActive: boolean; writeTargets: string[] };
-
-function approvalSnapshot(controller: SshRoController): PersistedApprovalState {
-	return {
-		version: 1,
-		targets: controller.approved(),
-		writeTargets: controller.writeTargets(),
-		toolsActive: controller.inspectionToolsActive(),
-	};
-}
-
-function latestPersistedApprovalState(ctx: ExtensionContext): PersistedApprovalState | undefined {
-	const entries = ctx.sessionManager.getEntries();
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const entry = entries[index] as { type?: string; customType?: string; data?: unknown };
-		if (entry.type !== "custom" || entry.customType !== SSHRO_APPROVAL_STATE_ENTRY || !entry.data || typeof entry.data !== "object") continue;
-		const data = entry.data as { version?: unknown; targets?: unknown; toolsActive?: unknown; writeTargets?: unknown };
-		if (data.version !== undefined && data.version !== 1) continue;
-		if (!Array.isArray(data.targets) || !data.targets.every((target) => typeof target === "string")) continue;
-		const writeTargets = data.writeTargets ?? [];
-		if (!Array.isArray(writeTargets) || !writeTargets.every((target) => typeof target === "string")) return undefined;
-		return { version: 1, targets: data.targets, toolsActive: data.toolsActive === true, writeTargets };
-	}
-	return undefined;
 }
 
 function activationSummary(report: ActivationReport): string {
@@ -964,7 +884,7 @@ export type SshReadonlyExtensionOptions = {
 
 export default function sshReadonlyExtension(pi: ExtensionAPI, options: SshReadonlyExtensionOptions = {}) {
 	const executeSsh = options.sshExecutor ?? sshExec;
-	let controller!: SshRoController;
+	const controller = new SshRoController({ pi, whitelistedTargets: whitelistedHosts });
 	let lastPersistedSnapshot: string | undefined;
 	const persistState = () => {
 		const snapshot = approvalSnapshot(controller);
@@ -973,11 +893,6 @@ export default function sshReadonlyExtension(pi: ExtensionAPI, options: SshReado
 		pi.appendEntry(SSHRO_APPROVAL_STATE_ENTRY, snapshot);
 		lastPersistedSnapshot = serialized;
 	};
-	controller = new SshRoController({
-		pi,
-		whitelistedTargets: whitelistedHosts,
-		validateTarget,
-	});
 	let suggestedTargets = [...whitelistedHosts()].sort();
 
 	pi.registerFlag("ssh-ro", {
@@ -990,56 +905,23 @@ export default function sshReadonlyExtension(pi: ExtensionAPI, options: SshReado
 		updateStatus(controller, ctx);
 	});
 
-	const syncWriteTool = () => {
-		const active = pi.getActiveTools().filter((name) => name !== "ssh_exec");
-		if (controller.writeTargets().length > 0) active.push("ssh_exec");
-		pi.setActiveTools(active);
-	};
-
-	pi.registerTool({
-		name: "ssh_exec",
-		label: "SSH unrestricted execution",
-		description: "Execute arbitrary POSIX shell commands on an exact target granted write access by the human via /sshro allow-write. No read-only path restrictions or secret redaction. Unapproved targets fail without prompting. Non-interactive; commands start in the remote login directory. Output is bounded to 2,000 lines/50KB. Revocation, cancellation and timeout do not undo changes or guarantee remote processes stop.",
-		parameters: Type.Object({
-			target: Type.String({ description: "Exact target string granted by the human; aliases and other users are separate targets." }),
-			command: Type.String({ minLength: 1, description: "Arbitrary remote POSIX shell script. Use heredocs to write files; no interactive stdin or TTY." }),
-			timeout: Type.Optional(Type.Integer({ minimum: 1, maximum: 3600, description: "Timeout in seconds (default 120, maximum 3600)." })),
-		}),
-		executionMode: "sequential",
-		async execute(_id, params, signal) {
-			const target = controller.requireWriteTarget(params.target);
-			if (!params.command.trim() || params.command.includes("\0")) throw new Error("command must be nonempty and contain no NUL bytes");
-			const timeout = params.timeout ?? 120;
-			if (!Number.isInteger(timeout) || timeout < 1 || timeout > 3600) throw new Error("timeout must be an integer from 1 to 3600 seconds");
-			// Quote the script as a separate shell argument so comments, heredocs and
-			// exit cannot consume or bypass the transport's status/time wrapper.
-			const result = await executeSsh(target, `sh -c ${shellQuote(params.command)}`, signal, timeout * 1000);
-			const output = truncateText(result.stdout + (result.stderr ? `\n[stderr]\n${result.stderr}` : "")) + captureTruncationNote(result);
-			return textResult(`${output}\n\n[ssh WRITE: ${target} | exit: ${result.code ?? "unknown"}${result.remoteTime ? ` | remote time: ${result.remoteTime}` : ""}]`, result.code !== 0);
-		},
-		renderCall(args, theme) {
-			const title = theme.fg("toolTitle", theme.bold("ssh_exec"));
-			const target = theme.fg("accent", args.target ?? "...");
-			const timeout = args.timeout === undefined ? "" : theme.fg("dim", ` · timeout ${args.timeout}s`);
-			return new Text(`${title} ${target}${timeout}\n${theme.fg("muted", args.command ?? "...")}`, 0, 0);
-		},
-	});
-
-	pi.on("before_agent_start", () => {
-		const targets = controller.writeTargets();
-		if (targets.length === 0) return;
-		return { message: { customType: "sshro-write-access", content: `Current session unrestricted SSH grants (use ssh_exec with the exact target): ${targets.join(", ")}. All sshro_* tools remain read-only.`, display: false } };
-	});
+	const syncWriteTool = registerUnrestrictedExec(pi, controller, executeSsh);
 
 	pi.registerCommand("sshro", {
 		description: "Approve a read-only target, allow-write/revoke-write <target>, status, or logout",
 		getArgumentCompletions: (prefix) => {
+			const descriptions = new Map([
+				["status", "Show SSH approvals and write grants"],
+				["logout", "Clear all approvals and unload SSH tools"],
+				["allow-write", "Grant unrestricted execution after confirmation"],
+				["revoke-write", "Revoke unrestricted execution"],
+			]);
 			const values = ["status", "logout", "allow-write ", "revoke-write ", ...suggestedTargets,
 				...suggestedTargets.map((target) => `allow-write ${target}`),
 				...controller.writeTargets().map((target) => `revoke-write ${target}`)];
 			const matches = [...new Set(values)]
 				.filter((value) => value.startsWith(prefix))
-				.map((value) => ({ value, label: value, description: value === "status" ? "Show SSH approvals and write grants" : value === "logout" ? "Clear all approvals and unload SSH tools" : value.startsWith("allow-write ") ? "Grant unrestricted execution after confirmation" : value.startsWith("revoke-write ") ? "Revoke unrestricted execution" : "Approve this exact read-only target" }));
+				.map((value) => ({ value, label: value, description: descriptions.get(value.split(" ", 1)[0]) ?? "Approve this exact read-only target" }));
 			return matches.length > 0 ? matches : null;
 		},
 		handler: async (args, ctx) => {
@@ -1078,7 +960,7 @@ export default function sshReadonlyExtension(pi: ExtensionAPI, options: SshReado
 				return;
 			}
 			if (value === "logout") {
-				controller.clearApprovals({ emit: false });
+				controller.clearApprovals();
 				controller.clearCaches();
 				controller.deactivateInspectionTools();
 				syncWriteTool();
@@ -1125,12 +1007,12 @@ export default function sshReadonlyExtension(pi: ExtensionAPI, options: SshReado
 				if (persisted?.toolsActive) controller.activateInspectionTools();
 				lastPersistedSnapshot = JSON.stringify(approvalSnapshot(controller));
 			} catch {
-				controller.clearApprovals({ emit: false });
+				controller.clearApprovals();
 				persistState();
 				ctx.ui.notify("Ignored invalid persisted SSH read-only approval state", "warning");
 			}
 		} else {
-			controller.clearApprovals({ emit: false });
+			controller.clearApprovals();
 			persistState();
 		}
 
@@ -1157,7 +1039,7 @@ export default function sshReadonlyExtension(pi: ExtensionAPI, options: SshReado
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
-		controller.clearApprovals({ emit: false });
+		controller.clearApprovals();
 		controller.clearCaches();
 		if (ctx.hasUI) ctx.ui.setStatus(SSHRO_STATUS_KEY, undefined);
 	});

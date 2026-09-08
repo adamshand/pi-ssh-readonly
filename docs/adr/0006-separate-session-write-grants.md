@@ -1,0 +1,3 @@
+# Separate session write grants from read-only approval
+
+Staging configuration needs arbitrary commands without weakening inspection protections on other targets. Use a separately human-confirmed, exact-target Write Grant and an `ssh_exec` tool rather than destination exceptions in the bash guard: shell parsing cannot reliably determine every SSH destination. Grants share the reload-only lifetime of read-only approvals, but neither read-only approval nor whitelist membership implies write access; revocation blocks future executions and cannot undo mutations or guarantee already-started remote processes stop.

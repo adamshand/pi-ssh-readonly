@@ -31,10 +31,16 @@ It redacts and filters obvious password/secret risks, but doesn't try and catch 
 
 ## Install
 
-Requires Pi `0.83.x` and Node.js `22.19` or newer.
+Requires Pi `0.83` or newer and Node.js `22.19` or newer. Development checks and the clean npm-install smoke test use Pi `0.85.1`.
 
 ```
-pi install git:git@github.com:adamshand/pi-ssh-readonly
+pi install npm:pi-ssh-readonly
+```
+
+Alternatively, install from Git (choose one source, not both):
+
+```
+pi install git:github.com/adamshand/pi-sshro
 ```
 
 ## Usage
@@ -132,9 +138,9 @@ The detailed tools are activated additively, preserving local tools and tools fr
 
 Inspection names are collected from the definitions as they are registered, preventing activation metadata from drifting away from the actual tool suite. An instance-scoped controller owns approval, activation, pending prompts, and caches. A small session entry preserves approval and activation across hot reload only; it is deliberately ignored and reset for a fresh process or replacement session.
 
-Remote pipelines emit an out-of-band producer-status marker so filters such as `sed` cannot turn a failed inspection into a successful result. Genuine failures are thrown so Pi marks the tool result as an error; expected states such as grep finding no matches, `systemctl status` reporting an inactive unit, or a bounded reader receiving SIGPIPE after `head` has enough data remain successful information. Process stdout and stderr are bounded independently, retain final status markers, and report truncation. Normal agent-facing results use Pi's standard 2,000-line/50KB truncation helpers.
+Remote pipelines emit out-of-band status markers for the producer and each filter, so a successful final stage cannot hide an earlier failure. Expected grep-filter no-match states are normalized separately from invalid expressions. Remote row limits drain their producer and explicitly report omitted rows. Genuine failures are thrown so Pi marks the tool result as an error; expected states such as grep finding no matches, `systemctl status` reporting an inactive unit, or a bounded reader receiving SIGPIPE after `head` has enough data remain successful information. Process stdout and stderr are bounded independently, retain final status markers, and report truncation. Normal agent-facing results use Pi's standard 2,000-line/50KB truncation helpers.
 
-SSH transport construction, target policy, command resolution, approval state, path policy, and output parsing live in separate modules with testable boundaries. Command lookup caches only completed remote lookups: transport failures remain retryable and are not misreported as missing binaries.
+SSH transport construction, operand validation/command construction, target policy, command resolution, approval snapshots, path policy, and output parsing live in separate modules with testable boundaries. Unrestricted tool registration is separate from the inspection suite. A shared result boundary caps both successful output and error messages, preserving a bounded target footer. Timeout and cancellation settle without waiting for inherited pipes and kill the local SSH process group on POSIX; this still does not guarantee remote processes stop. Command lookup caches only completed remote lookups: transport failures remain retryable and are not misreported as missing binaries.
 
 ## Configuration
 
@@ -160,7 +166,7 @@ Host *
   ControlPersist 900
 ```
 
-`index.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. `.env`, `*.env`, shell history files, SSH/cloud credential directories, password-manager data, chezmoi data). Listings still show blocked entries with a compact `[blocked]` marker where possible so the agent knows they exist and can ask for help if needed. Recursive `sshro_grep` excludes blocked credential/history/password-manager paths. `sshro_grep` uses extended regex (`grep -E`) by default; use `literal=true` for fixed-string search. If you have specific requirements edit this.
+`src/path-policy.ts` includes a basic list of files/folders which the agent is not allowed to read (eg. `.env`, `*.env`, shell history files, SSH/cloud credential directories, password-manager data, chezmoi data). Listings still show blocked entries with a compact `[blocked]` marker where possible so the agent knows they exist and can ask for help if needed. Recursive `sshro_grep` derives exclusions from the same credential/history/password-manager policy as direct reads. Since grep matches directory exclusions by basename, credential-path leaves such as `gh`, `gcloud`, `chezmoi`, and `credentials` are conservatively excluded even outside their usual parent directories. `sshro_grep` uses extended regex (`grep -E`) by default; use `literal=true` for fixed-string search. If you have specific requirements edit this.
 
 `sshro_ls` supports `recursive=true` for live recursive listings. Recursive listing uses `eza -1l --absolute=on -R --color=never --icons=never` when available, filters eza grouping headers, and falls back to `ls -laR` otherwise.
 
@@ -184,7 +190,7 @@ Avoid broad rules such as `NOPASSWD: ALL`, `/usr/bin/find *`, or shell access.
 
 `sshro_read` supports negative `offset` values for efficient tail-style reads of large files, e.g. `offset=-100` reads the last 100 lines. Before returning content, it samples the same `cat` command it would use for the read, runs the sample through remote `file --mime-type`, and refuses non-text content.
 
-Docker tools are optional and checked when the tool runs, not at startup. `sshro_docker_ps` returns compact `docker ps --no-trunc` table output, defaults to active containers only, and reports `No active Docker containers` when only the header is returned. Use `all=true` to include stopped/exited containers. `sshro_docker_stats` returns parsed JSON using Docker's native field names and rejects `limit` values below 1. If output is row-limited, Docker row tools append an `[ssh-ro output truncated ...]` note. `sshro_docker_inspect` uses `target` for the SSH target and `object` for the Docker object name/ID, and returns Docker-shaped JSON with targeted redaction: environment variables are visibly redacted, sensitive-looking label values are redacted, and image `GraphDriver.Data` is omitted. Docker command strings, mountpoints, and network topology may be visible. `sshro_docker_stats` always uses one-shot `--no-stream` mode; call it multiple times a few seconds apart to compare noisy CPU readings.
+Docker tools are optional and checked when the tool runs, not at startup. `sshro_docker_ps` returns compact `docker ps --no-trunc` table output, defaults to active containers only, and reports `No active Docker containers` when only the header is returned. Use `all=true` to include stopped/exited containers. `sshro_docker_stats` returns parsed JSON using Docker's native field names and rejects `limit` values below 1. If output is row-limited, Docker row tools append an `[ssh-ro output truncated ...]` note. `sshro_docker_inspect` uses `target` for the SSH target and `object` for the Docker object name/ID, and returns Docker-shaped JSON with targeted redaction: environment variables are visibly redacted, sensitive-looking label values are redacted, and image `GraphDriver.Data` is omitted. If Docker inspect output cannot be parsed/redacted, raw output and parser diagnostics are withheld; failed inspect commands also withhold raw diagnostics because they may contain secrets. Docker command strings, mountpoints, and network topology may be visible. `sshro_docker_stats` always uses one-shot `--no-stream` mode; call it multiple times a few seconds apart to compare noisy CPU readings.
 
 `sshro_dig` runs bounded DNS lookups from the remote host using `dig +time=3 +tries=1`. `dig` is checked when the tool runs and returns a clear error if missing.
 
@@ -203,9 +209,12 @@ Docker tools are optional and checked when the tool runs, not at startup. `sshro
 ```bash
 npm install
 npm run check
+npm run smoke:package
 ```
 
-`npm run check` performs a strict TypeScript typecheck, unit tests, fake-Pi lifecycle tests, shell-level pipeline tests through a fake SSH executable, and a real-extension smoke check without contacting a model. The transport tests cover option boundaries, completed-vs-failed remote execution, large bounded reads, and timeout behavior.
+`npm run check` performs a strict TypeScript typecheck, unit tests, fake-Pi lifecycle tests, shell-level pipeline tests through a fake SSH executable, and a real-extension smoke check without contacting a model. The transport tests cover option boundaries, completed-vs-failed remote execution, intermediate filter failures, disclosed truncation, large bounded reads, and timeout/cancellation with inherited pipes. Tool-level regression tests cover recursive credential policy, option-shaped operands, redaction failures, oversized output, and malformed authorization snapshots.
+
+`npm run smoke:package` requires registry access. It builds a tarball in a temporary directory, checks its file list, installs it without development dependencies, and verifies the installed extension loads in a clean Pi configuration. It does not publish anything or contact a model. See [architecture notes](docs/architecture.md) for invariants and decisions.
 
 ## Future
 

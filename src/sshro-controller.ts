@@ -1,3 +1,4 @@
+import { normalizeSshTarget } from "./target-policy.ts";
 import {
 	activateSshRoInspectionTools,
 	deactivateSshRoInspectionTools,
@@ -22,15 +23,11 @@ export type SudoCheck = { allowed: boolean; reason: string };
 type SshRoControllerOptions = {
 	pi: ToolActivationApi;
 	whitelistedTargets: () => ReadonlySet<string>;
-	validateTarget: (target: string) => void;
-	onApprovalsChanged?: (targets: string[]) => void;
 };
 
 export class SshRoController {
 	readonly #pi: ToolActivationApi;
 	readonly #whitelistedTargets: () => ReadonlySet<string>;
-	readonly #validateTarget: (target: string) => void;
-	readonly #onApprovalsChanged?: (targets: string[]) => void;
 	#inspectionToolNames: string[] = [];
 	readonly #approvedTargets = new Set<string>();
 	readonly #writeTargets = new Set<string>();
@@ -42,8 +39,6 @@ export class SshRoController {
 	constructor(options: SshRoControllerOptions) {
 		this.#pi = options.pi;
 		this.#whitelistedTargets = options.whitelistedTargets;
-		this.#validateTarget = options.validateTarget;
-		this.#onApprovalsChanged = options.onApprovalsChanged;
 	}
 
 	setInspectionToolNames(names: readonly string[]): void {
@@ -63,8 +58,7 @@ export class SshRoController {
 	}
 
 	async allowWriteHumanInitiated(raw: string, ctx: ApprovalUiContext): Promise<string> {
-		const target = raw.trim();
-		this.#validateTarget(target);
+		const target = normalizeSshTarget(raw);
 		if (!ctx.hasUI) throw new Error("Write access requires human confirmation, but no UI is available.");
 		const generation = this.#approvalGeneration;
 		const approved = await ctx.ui.confirm(
@@ -77,25 +71,20 @@ export class SshRoController {
 	}
 
 	requireWriteTarget(raw: string): string {
-		const target = raw.trim();
-		this.#validateTarget(target);
+		const target = normalizeSshTarget(raw);
 		if (!this.#writeTargets.has(target)) throw new Error(`No write grant for ${target}. Ask the human to run /sshro allow-write ${target}. This tool cannot request approval.`);
 		return target;
 	}
 
 	revokeWrite(raw: string): string {
-		const target = raw.trim();
-		this.#validateTarget(target);
+		const target = normalizeSshTarget(raw);
 		this.#approvalGeneration++;
 		this.#writeTargets.delete(target);
 		return target;
 	}
 
 	restoreWriteTargets(targets: readonly string[]): void {
-		const validated = targets.map((target) => {
-			this.#validateTarget(target);
-			return target;
-		});
+		const validated = targets.map(normalizeSshTarget);
 		this.#writeTargets.clear();
 		for (const target of validated) this.#writeTargets.add(target);
 	}
@@ -109,31 +98,22 @@ export class SshRoController {
 	}
 
 	approveHumanInitiated(target: string): string {
-		const trimmed = target.trim();
-		this.#validateTarget(trimmed);
-		const changed = !this.#approvedTargets.has(trimmed);
+		const trimmed = normalizeSshTarget(target);
 		this.#approvedTargets.add(trimmed);
-		if (changed) this.#emitApprovals();
 		return trimmed;
 	}
 
 	restoreApprovals(targets: readonly string[]): void {
-		const validated = targets.map((raw) => {
-			const target = raw.trim();
-			this.#validateTarget(target);
-			return target;
-		});
+		const validated = targets.map(normalizeSshTarget);
 		this.#approvedTargets.clear();
 		for (const target of validated) this.#approvedTargets.add(target);
 	}
 
-	clearApprovals(options: { emit?: boolean } = {}): void {
-		const changed = this.#approvedTargets.size > 0;
+	clearApprovals(): void {
 		this.#approvalGeneration++;
 		this.#approvedTargets.clear();
 		this.#writeTargets.clear();
 		this.#pendingTargetApprovals.clear();
-		if (options.emit !== false && changed) this.#emitApprovals();
 	}
 
 	clearCaches(): void {
@@ -142,8 +122,7 @@ export class SshRoController {
 	}
 
 	async authorize(target: string, ctx: ApprovalUiContext, signal?: AbortSignal): Promise<string> {
-		const trimmed = target.trim();
-		this.#validateTarget(trimmed);
+		const trimmed = normalizeSshTarget(target);
 		if (this.isApproved(trimmed)) return trimmed;
 
 		let approval = this.#pendingTargetApprovals.get(trimmed);
@@ -160,7 +139,6 @@ export class SshRoController {
 			).then((approved) => {
 				if (approved && generation === this.#approvalGeneration) {
 					this.#approvedTargets.add(trimmed);
-					this.#emitApprovals();
 					return true;
 				}
 				return false;
@@ -199,9 +177,7 @@ export class SshRoController {
 	}
 
 	getCachedRemoteCommand(key: string): { found: boolean; value: string | undefined } {
-		return this.#remoteCommandCache.has(key)
-			? { found: true, value: this.#remoteCommandCache.get(key) }
-			: { found: false, value: undefined };
+		return { found: this.#remoteCommandCache.has(key), value: this.#remoteCommandCache.get(key) };
 	}
 
 	cacheRemoteCommand(key: string, value: string | undefined): void {
@@ -216,7 +192,4 @@ export class SshRoController {
 		this.#sudoCheckCache.set(key, value);
 	}
 
-	#emitApprovals(): void {
-		this.#onApprovalsChanged?.(this.approved());
-	}
 }

@@ -55,6 +55,21 @@ export function denyReasonForPath(path: string): string | undefined {
 	return undefined;
 }
 
+/** grep matches exclusions by basename, so conservatively exclude credential
+ * path leaves everywhere, even outside their usual parent directory. Include
+ * both file and directory forms: path-policy blocks descendants of either. */
+export function recursiveGrepPolicyArgs(): string[] {
+	const pathLeaves = DENIED_PATH_PARTS.map((path) => path.split("/").at(-1)!);
+	const dirs = new Set([...DENIED_DIR_NAMES, ...pathLeaves, ".git", "node_modules"]);
+	const files = new Set([...DENIED_FILE_NAMES, ...pathLeaves]);
+	return [
+		...[...dirs].map((name) => `--exclude-dir=${name}`),
+		...[...files].map((name) => `--exclude=${name}`),
+		...DENIED_FILE_PREFIXES.map((prefix) => `--exclude=${prefix}*`),
+		...DENIED_FILE_SUFFIXES.map((suffix) => `--exclude=*${suffix}`),
+	];
+}
+
 export function assertPathAllowed(path: string): void {
 	const reason = denyReasonForPath(path);
 	if (reason) throw new Error(`SSH read-only tools block this path by default: ${reason}`);

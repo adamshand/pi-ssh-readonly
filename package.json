@@ -28,13 +28,15 @@
     "README.md",
     "LICENSE",
     "CONTEXT.md",
-    "docs/adr"
+    "docs/adr",
+    "docs/architecture.md"
   ],
   "scripts": {
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "smoke": "pi --no-extensions -e ./index.ts --help | grep -q -- '--ssh-ro'",
-    "check": "npm run typecheck && npm test && npm run smoke"
+    "check": "npm run typecheck && npm test && npm run smoke",
+    "smoke:package": "node scripts/package-smoke.ts"
   },
   "pi": {
     "extensions": [
@@ -42,20 +44,15 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.83.0",
-    "@earendil-works/pi-coding-agent": "^0.83.0",
-    "@earendil-works/pi-tui": "^0.83.0",
-    "typebox": "^1.3.10"
-  },
-  "overrides": {
-    "minimatch": {
-      "brace-expansion": "5.0.9"
-    }
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.83.0",
-    "@earendil-works/pi-coding-agent": "0.83.0",
-    "@earendil-works/pi-tui": "0.83.0",
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-tui": "0.85.1",
     "@types/node": "^24.0.0",
     "typebox": "1.3.10",
     "typescript": "^5.9.3"

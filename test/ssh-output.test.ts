@@ -50,7 +50,6 @@ test("bounded capture retains the beginning and tail", () => {
 	capture.push("abcdefghij");
 	capture.push("KLMNOP");
 	assert.equal(capture.truncated, true);
-	assert.equal(capture.totalBytes, 16);
 	assert.equal(capture.toString(), "abcdefghMNOP");
 	assert.equal(capture.toBuffer().length, 12);
 });

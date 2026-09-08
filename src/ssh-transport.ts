@@ -1,16 +1,12 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable } from "node:stream";
-import { BoundedCapture, parseRemoteStderr, REMOTE_TIME_MARKER } from "./ssh-output.ts";
+import { BoundedCapture, parseRemoteStderr, REMOTE_TIME_MARKER, type ParsedRemoteStderr } from "./ssh-output.ts";
 
 export const DEFAULT_SSH_TIMEOUT_MS = 30_000;
 export const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
-const KILL_GRACE_MS = 2_000;
 
-export type SshExecResult = {
+export type SshExecResult = ParsedRemoteStderr & {
 	stdout: string;
-	stderr: string;
-	code: number | null;
-	remoteTime?: string;
 	stdoutTruncated: boolean;
 	stderrTruncated: boolean;
 };
@@ -40,7 +36,7 @@ export function buildSshArgs(target: string, command: string): string[] {
 }
 
 function defaultSpawn(binary: string, args: readonly string[]): SshChild {
-	return spawn(binary, [...args], { stdio: ["ignore", "pipe", "pipe"] });
+	return spawn(binary, [...args], { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
 }
 
 export function createSshExecutor(options: { binary?: string; spawnSsh?: SpawnSsh } = {}): SshExecutor {
@@ -62,56 +58,45 @@ export function createSshExecutor(options: { binary?: string; spawnSsh?: SpawnSs
 
 		const stdout = new BoundedCapture(MAX_CAPTURE_BYTES);
 		const stderr = new BoundedCapture(MAX_CAPTURE_BYTES);
-		let timedOut = false;
 		let settled = false;
-		let killTimer: NodeJS.Timeout | undefined;
-
-		const terminate = () => {
-			child.kill("SIGTERM");
-			killTimer ??= setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
-			killTimer.unref?.();
-		};
-		const timer = setTimeout(() => {
-			timedOut = true;
-			terminate();
-		}, timeoutMs);
-		timer.unref?.();
-		const onAbort = () => terminate();
-		signal?.addEventListener("abort", onAbort, { once: true });
-
+		let timer: NodeJS.Timeout | undefined;
+		const onAbort = () => rejectOnce(new Error("SSH command aborted"));
 		const cleanup = () => {
 			clearTimeout(timer);
-			if (killTimer) clearTimeout(killTimer);
 			signal?.removeEventListener("abort", onAbort);
 		};
 		const rejectOnce = (error: unknown) => {
 			if (settled) return;
 			settled = true;
 			cleanup();
+			// Own a process group for the default POSIX transport, so local SSH
+			// helpers die too. Never wait for inherited pipes to close: even an
+			// escaped descendant cannot hold this Promise past its deadline.
+			try {
+				if (!options.spawnSsh && process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+				else child.kill("SIGKILL");
+			} catch { child.kill("SIGKILL"); }
+			child.stdout.destroy();
+			child.stderr.destroy();
 			reject(error);
 		};
 
 		child.stdout.on("data", (data) => stdout.push(data));
 		child.stderr.on("data", (data) => stderr.push(data));
 		child.on("error", rejectOnce);
+		child.stdout.on("error", rejectOnce);
+		child.stderr.on("error", rejectOnce);
+		timer = setTimeout(() => rejectOnce(new Error(`SSH command timed out after ${timeoutMs / 1000}s`)), timeoutMs);
+		timer.unref?.();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) onAbort();
 		child.on("close", (code) => {
 			if (settled) return;
 			settled = true;
 			cleanup();
-			if (signal?.aborted) {
-				reject(new Error("SSH command aborted"));
-				return;
-			}
-			if (timedOut) {
-				reject(new Error(`SSH command timed out after ${timeoutMs / 1000}s`));
-				return;
-			}
-			const parsed = parseRemoteStderr(stderr.toString(), code);
 			resolve({
+				...parseRemoteStderr(stderr.toString(), code),
 				stdout: stdout.toString(),
-				stderr: parsed.stderr,
-				remoteTime: parsed.remoteTime,
-				code: parsed.code,
 				stdoutTruncated: stdout.truncated,
 				stderrTruncated: stderr.truncated,
 			});
@@ -129,7 +114,9 @@ export function requireRemoteExecution(result: SshExecResult, operation: string)
 
 export function captureTruncationNote(result: SshExecResult): string {
 	const streams = [result.stdoutTruncated ? "stdout" : undefined, result.stderrTruncated ? "stderr" : undefined].filter(Boolean);
-	return streams.length > 0 ? `\n\n[ssh-ro ${streams.join(" and ")} capture truncated at ${MAX_CAPTURE_BYTES} bytes per stream]` : "";
+	const capture = streams.length > 0 ? `\n\n[ssh-ro ${streams.join(" and ")} capture truncated at ${MAX_CAPTURE_BYTES} bytes per stream]` : "";
+	const rows = result.remoteTruncation;
+	return capture + (rows ? `\n\n[ssh-ro output truncated: showing ${rows.shown} of ${rows.total} lines]` : "");
 }
 
 export function requireCompleteCapture(result: SshExecResult, operation: string): void {
