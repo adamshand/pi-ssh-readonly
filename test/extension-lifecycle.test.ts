@@ -115,6 +115,124 @@ function sshResult(overrides: Partial<SshExecResult>): SshExecResult {
 	};
 }
 
+test("ssh_exec renders its target and multiline command above the default output", () => {
+	const pi = new FakePi();
+	sshReadonlyExtension(pi.api());
+	const tool = pi.tools.get("ssh_exec");
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const command = "cat <<'EOF'\nhello world\nEOF";
+	const component = tool.renderCall({ target: "root@staging", command, timeout: 300 }, theme);
+	const rendered = component.render(100).join("\n");
+	assert.match(rendered, /ssh_exec root@staging · timeout 300s/);
+	for (const line of command.split("\n")) assert.ok(rendered.includes(line));
+	assert.ok(component.render(20).length > component.render(100).length);
+	assert.doesNotThrow(() => tool.renderCall({}, theme).render(40));
+	assert.equal(tool.renderResult, undefined, "keep Pi's default collapsible output renderer");
+});
+
+test("write grants are human-confirmed, exact-target, and independent of read-only approvals", async () => {
+	const calls: any[] = [];
+	const pi = new FakePi();
+	sshReadonlyExtension(pi.api(), { sshExecutor: async (...args) => {
+		calls.push(args);
+		return sshResult({ stdout: "secret=unredacted\n" });
+	} });
+	await pi.emit("session_start", { reason: "startup" });
+	await pi.runCommand("root@172.16.1.52");
+	pi.context.ui.confirm = async () => { throw new Error("unexpected tool approval prompt"); };
+	await assert.rejects(pi.runTool("ssh_exec", { target: "root@172.16.1.52", command: "id" }), /No write grant/);
+	pi.context.ui.confirm = async () => false;
+	await pi.runCommand("allow-write root@172.16.1.52");
+	assert.ok(!pi.active.includes("ssh_exec"));
+	pi.context.ui.confirm = async () => true;
+	await pi.runCommand("allow-write root@172.16.1.52");
+	assert.ok(pi.active.includes("ssh_exec"));
+	assert.match(pi.statuses.get("sshro")!, /SSH WRITE: root@172.16.1.52/);
+	const command = "cat > /root/.env <<'EOF'\nsecret=value\nEOF\n# trailing comment";
+	const result = await pi.runTool("ssh_exec", { target: "root@172.16.1.52", command, timeout: 300 });
+	assert.match(result.content[0].text, /secret=unredacted/);
+	assert.equal(calls[0][0], "root@172.16.1.52");
+	assert.match(calls[0][1], /^sh -c '/);
+	assert.equal(calls[0][3], 300000);
+	for (const target of ["172.16.1.52", "other@172.16.1.52", "root@production", "-oProxyCommand=bad"]) {
+		await assert.rejects(pi.runTool("ssh_exec", { target, command: "id" }));
+	}
+	assert.equal(calls.length, 1);
+	await assert.rejects(pi.runTool("sshro_read", { target: "root@172.16.1.52", path: "/root/.env" }), /blocked|denied/i);
+	const guard = pi.handlers.get("tool_call")![0];
+	assert.equal((await guard({ toolName: "bash", input: { command: "ssh root@172.16.1.52 id" } }, pi.context) as any).block, true);
+	await pi.runCommand("status");
+	assert.match(pi.notifications.at(-1)!.message, /Unrestricted write targets: root@172.16.1.52/);
+	await pi.runCommand("revoke-write root@172.16.1.52");
+	assert.ok(!pi.active.includes("ssh_exec"));
+	await assert.rejects(pi.runTool("ssh_exec", { target: "root@172.16.1.52", command: "id" }), /No write grant/);
+	assert.ok(pi.active.includes("read"));
+});
+
+test("write grants survive only reload and logout cannot be resurrected by reload", async () => {
+	const first = new FakePi();
+	sshReadonlyExtension(first.api());
+	await first.emit("session_start", { reason: "startup" });
+	await first.runCommand("allow-write root@staging");
+	await first.emit("session_shutdown", { reason: "reload" });
+	for (const reason of ["reload", "startup", "new", "resume", "fork"]) {
+		const pi = new FakePi({ entries: first.entries });
+		sshReadonlyExtension(pi.api());
+		await pi.emit("session_start", { reason });
+		assert.equal(pi.active.includes("ssh_exec"), reason === "reload");
+		if (reason !== "reload") {
+			await assert.rejects(pi.runTool("ssh_exec", { target: "root@staging", command: "id" }), /No write grant/);
+		} else {
+			await pi.runCommand("logout");
+			await pi.emit("session_start", { reason: "reload" });
+			assert.ok(!pi.active.includes("ssh_exec"));
+			assert.equal(pi.statuses.get("sshro"), undefined);
+		}
+	}
+});
+
+test("write grants fail closed without UI, on invalid input, and across pending-confirmation resets", async () => {
+	const pi = new FakePi({ hasUI: false });
+	sshReadonlyExtension(pi.api());
+	await pi.emit("session_start", { reason: "startup" });
+	await pi.runCommand("allow-write root@staging");
+	assert.match(pi.notifications.at(-1)!.message, /no UI/);
+	pi.context.hasUI = true;
+	for (const args of ["allow-write", "allow-write -oHostName=prod", "allow-write root@staging extra"]) {
+		await pi.runCommand(args);
+		assert.ok(!pi.active.includes("ssh_exec"));
+	}
+	let confirm!: (answer: boolean) => void;
+	pi.context.ui.confirm = () => new Promise<boolean>((resolve) => { confirm = resolve; });
+	const pending = pi.runCommand("allow-write root@staging");
+	await pi.runCommand("logout");
+	confirm(true);
+	await pending;
+	assert.ok(!pi.active.includes("ssh_exec"));
+});
+
+test("ssh_exec preserves failures, bounds output, passes cancellation, and respects tool policy", async () => {
+	const pi = new FakePi({ blockedTools: ["ssh_exec"] });
+	const signal = new AbortController().signal;
+	let response = sshResult({ stdout: "x".repeat(100000), stdoutTruncated: true });
+	sshReadonlyExtension(pi.api(), { sshExecutor: async (_target, _command, receivedSignal) => {
+		assert.equal(receivedSignal, signal);
+		return response;
+	} });
+	await pi.emit("session_start", { reason: "startup" });
+	await pi.runCommand("allow-write root@staging");
+	assert.ok(!pi.active.includes("ssh_exec"));
+	assert.match(pi.notifications.at(-1)!.message, /blocked by Pi tool policy/);
+	const execute = () => pi.tools.get("ssh_exec").execute("id", { target: "root@staging", command: "id" }, signal);
+	const result = await execute();
+	assert.ok(result.content[0].text.length < 53000);
+	assert.match(result.content[0].text, /truncated/);
+	response = sshResult({ code: 7, stderr: "failed" });
+	await assert.rejects(execute(), /failed[\s\S]*exit: 7/);
+	response = sshResult({ code: 255, remoteTime: undefined, stderr: "connection refused" });
+	await assert.rejects(execute(), /connection refused/);
+});
+
 test("session startup leaves only sshro_connect active and preserves unrelated tools", async () => {
 	const pi = new FakePi();
 	sshReadonlyExtension(pi.api());

@@ -99,6 +99,33 @@ Whenever this extension is loaded, agent-initiated `bash` tool calls are blocked
 
 Git-over-SSH is intentionally allowed, including explicit `git@host:path` and `ssh://` remote URLs and the standard `GIT_SSH` / `GIT_SSH_COMMAND` environment variables. This permits normal clone, fetch, pull, and push workflows; **pushes can modify a remote repository**. The bash guard is only a best-effort tripwire against accidental direct SSH use—not a process or network sandbox. Indirect SSH execution and non-SSH network tools remain possible. For an actual security boundary, run agent-controlled local tools in a sandbox such as Gondolin while leaving the fixed `sshro_*` tools and SSH credentials in the trusted host process.
 
+## Session-only unrestricted access
+
+For a staging or other trusted server that the agent needs to configure, run:
+
+```text
+/sshro allow-write root@172.16.1.52
+```
+
+After human confirmation, the extension enables `ssh_exec` for that **exact target string only**:
+
+```text
+ssh_exec({ target: "root@172.16.1.52", command: "apt-get update && apt-get install -y nginx", timeout: 300 })
+```
+
+This is arbitrary remote POSIX shell execution: **no read-only path restrictions or secret redaction**. Commands run non-interactively in the remote login directory, without a TTY or interactive stdin; use heredocs to write files. The default timeout is 120 seconds (configurable up to 3600). Output is bounded to 2,000 lines/50KB, with a truncation notice. Failed commands are reported as tool errors and may already have made changes.
+
+The footer displays `⚠ SSH WRITE` and the granted targets. `/sshro status` lists grants and whether `ssh_exec` is active. Grants survive `/reload` only; process restart, `/new`, `/resume`, `/fork` (including clone), and `/sshro logout` clear them. Pi tool allow/exclude settings still apply.
+
+```text
+/sshro revoke-write root@172.16.1.52
+/sshro logout
+```
+
+Revocation blocks subsequent executions; it does not undo changes or stop already-started remote processes. Cancellation and timeout likewise do not guarantee remote processes stop. The agent has no grant tool: calling `ssh_exec` without a grant fails **without an approval prompt**. Only the slash command with human confirmation grants access; neither `SSHRO_HOST_WHITELIST`, `--ssh-ro`, nor ordinary read-only approval grants write access.
+
+All `sshro_*` tools remain read-only, including on write-enabled targets, and the agent bash SSH guard remains unchanged. Exact matching is not IP identity pinning: OpenSSH still resolves targets through trusted local SSH configuration. Aliases and different usernames require separate grants. Unrestricted access to staging can also provide a route into production if staging has credentials or network access; this feature is not a sandbox or a barrier against pivoting.
+
 ## Architecture
 
 The detailed tools are activated additively, preserving local tools and tools from other extensions. On models with Pi's native deferred-tool support, their definitions are anchored at the `sshro_connect` result so the stable prompt prefix remains cacheable. Other models receive the expanded tool list normally on the next request, causing at most a one-time cache-prefix change when SSH inspection is first needed. Lazily loaded tools rely on their normal tool descriptions rather than active-only prompt snippets or guidelines.
@@ -163,7 +190,7 @@ Docker tools are optional and checked when the tool runs, not at startup. `sshro
 
 ## Trust boundaries and known issues
 
-“Read-only” means the extension offers fixed inspection command shapes rather than arbitrary remote mutation commands. It does **not** guarantee that the remote system observes zero writes: SSH authentication can update login/audit logs, reads can update access times, DNS inspection sends queries, and remote shell startup hooks or command implementations may have side effects. The local OpenSSH configuration, SSH client, remote login shell, and remote inspection binaries are trusted parts of the execution path.
+“Read-only” refers to the `sshro_*` tools, which offer fixed inspection command shapes rather than arbitrary remote mutation commands. The separately human-enabled `ssh_exec` tool is explicitly unrestricted. It does **not** guarantee that the remote system observes zero writes: SSH authentication can update login/audit logs, reads can update access times, DNS inspection sends queries, and remote shell startup hooks or command implementations may have side effects. The local OpenSSH configuration, SSH client, remote login shell, and remote inspection binaries are trusted parts of the execution path.
 
 - The agent `bash` guard is deliberately not a security boundary. Git-over-SSH is allowed, and indirect SSH execution or other remote mutation protocols cannot be reliably blocked by inspecting shell command text.
 - Canonical path checks prevent direct and symlinked reads of known credential/history paths, but this remains a denylist rather than a chroot or adversarial data-loss-prevention boundary. Allowed files, process arguments, logs, Docker metadata, and command output can still contain secrets.

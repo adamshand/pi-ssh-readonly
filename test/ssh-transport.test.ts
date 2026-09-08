@@ -68,6 +68,15 @@ test("intentional SIGPIPE from a bounded large-file read is accepted", async () 
 	assert.equal(result.stdout, "line\n".repeat(10));
 });
 
+test("quoted arbitrary scripts preserve heredocs, trailing comments, exit codes and remote metadata", async () => {
+	const execute = createSshExecutor({ binary: await fakeSshBinary() });
+	const script = "cat <<'EOF'\nquotes: ' and \" and $(not-executed)\nEOF\nexit 7\n# trailing comment";
+	const result = await execute("staging", `sh -c ${shellQuote(script)}`);
+	assert.equal(result.stdout, "quotes: ' and \" and $(not-executed)\n");
+	assert.equal(result.code, 7);
+	assert.ok(result.remoteTime);
+});
+
 test("executor enforces timeout", async () => {
 	const execute = createSshExecutor({ binary: await fakeSshBinary() });
 	const previous = process.env.FAKE_SSH_MODE;

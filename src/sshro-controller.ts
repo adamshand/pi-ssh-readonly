@@ -33,6 +33,7 @@ export class SshRoController {
 	readonly #onApprovalsChanged?: (targets: string[]) => void;
 	#inspectionToolNames: string[] = [];
 	readonly #approvedTargets = new Set<string>();
+	readonly #writeTargets = new Set<string>();
 	readonly #pendingTargetApprovals = new Map<string, Promise<boolean>>();
 	#approvalGeneration = 0;
 	readonly #remoteCommandCache = new Map<string, string | undefined>();
@@ -55,6 +56,48 @@ export class SshRoController {
 
 	approved(): string[] {
 		return [...this.#approvedTargets].sort();
+	}
+
+	writeTargets(): string[] {
+		return [...this.#writeTargets].sort();
+	}
+
+	async allowWriteHumanInitiated(raw: string, ctx: ApprovalUiContext): Promise<string> {
+		const target = raw.trim();
+		this.#validateTarget(target);
+		if (!ctx.hasUI) throw new Error("Write access requires human confirmation, but no UI is available.");
+		const generation = this.#approvalGeneration;
+		const approved = await ctx.ui.confirm(
+			"Allow unrestricted SSH execution?",
+			`Allow arbitrary commands on ${target} for this session?\n\nThe agent can modify or delete anything accessible to this SSH user, including secrets. Read-only path restrictions and redaction do not apply to ssh_exec. This host may provide access to other servers.`,
+		);
+		if (!approved || generation !== this.#approvalGeneration) throw new Error("SSH write access was denied or the grant request expired.");
+		this.#writeTargets.add(target);
+		return target;
+	}
+
+	requireWriteTarget(raw: string): string {
+		const target = raw.trim();
+		this.#validateTarget(target);
+		if (!this.#writeTargets.has(target)) throw new Error(`No write grant for ${target}. Ask the human to run /sshro allow-write ${target}. This tool cannot request approval.`);
+		return target;
+	}
+
+	revokeWrite(raw: string): string {
+		const target = raw.trim();
+		this.#validateTarget(target);
+		this.#approvalGeneration++;
+		this.#writeTargets.delete(target);
+		return target;
+	}
+
+	restoreWriteTargets(targets: readonly string[]): void {
+		const validated = targets.map((target) => {
+			this.#validateTarget(target);
+			return target;
+		});
+		this.#writeTargets.clear();
+		for (const target of validated) this.#writeTargets.add(target);
 	}
 
 	availableTargets(): string[] {
@@ -88,6 +131,7 @@ export class SshRoController {
 		const changed = this.#approvedTargets.size > 0;
 		this.#approvalGeneration++;
 		this.#approvedTargets.clear();
+		this.#writeTargets.clear();
 		this.#pendingTargetApprovals.clear();
 		if (options.emit !== false && changed) this.#emitApprovals();
 	}

@@ -1,7 +1,16 @@
 {
   "name": "pi-ssh-readonly",
   "version": "0.2.0",
-  "description": "Stateless, target-explicit read-only SSH inspection tools for pi.",
+  "description": "Read-only SSH inspection tools for pi, with human-approved session-only unrestricted access.",
+  "author": "Adam Shand",
+  "homepage": "https://github.com/adamshand/pi-sshro#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adamshand/pi-sshro.git"
+  },
+  "bugs": {
+    "url": "https://github.com/adamshand/pi-sshro/issues"
+  },
   "keywords": [
     "pi-package",
     "pi",
