@@ -214,6 +214,8 @@ npm run smoke:package
 
 `npm run check` performs a strict TypeScript typecheck, unit tests, fake-Pi lifecycle tests, shell-level pipeline tests through a fake SSH executable, and a real-extension smoke check without contacting a model. The transport tests cover option boundaries, completed-vs-failed remote execution, intermediate filter failures, disclosed truncation, large bounded reads, and timeout/cancellation with inherited pipes. Tool-level regression tests cover recursive credential policy, option-shaped operands, redaction failures, oversized output, and malformed authorization snapshots.
 
+`npm run lint:complexity` runs only Biome's cognitive complexity rule across extension code, tests, and scripts, with the default maximum score of 15. It is an exploratory check, separate from `npm run check` and CI: existing violations cause a nonzero exit. Formatting and other lint rules are disabled.
+
 `npm run smoke:package` requires registry access. It builds a tarball in a temporary directory, checks its file list, installs it without development dependencies, and verifies the installed extension loads in a clean Pi configuration. It does not publish anything or contact a model. See [architecture notes](docs/architecture.md) for invariants and decisions.
 
 ## Future

@@ -34,6 +34,7 @@
   "scripts": {
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
+    "lint:complexity": "biome lint .",
     "smoke": "pi --no-extensions -e ./index.ts --help | grep -q -- '--ssh-ro'",
     "check": "npm run typecheck && npm test && npm run smoke",
     "smoke:package": "node scripts/package-smoke.ts"
@@ -50,6 +51,7 @@
     "typebox": "*"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.12",
     "@earendil-works/pi-ai": "0.85.1",
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@earendil-works/pi-tui": "0.85.1",

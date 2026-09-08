@@ -907,6 +907,79 @@ export default function sshReadonlyExtension(pi: ExtensionAPI, options: SshReado
 
 	const syncWriteTool = registerUnrestrictedExec(pi, controller, executeSsh);
 
+	const notifyCommandError = (err: unknown, ctx: ExtensionContext) => {
+		ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+	};
+
+	const saveCommandState = (ctx: ExtensionContext) => {
+		persistState();
+		updateStatus(controller, ctx);
+	};
+
+	const changeWriteAccess = async (action: string, rawTarget: string | undefined, ctx: ExtensionContext) => {
+		try {
+			if (!rawTarget) throw new Error(`Usage: /sshro ${action} <target>`);
+			const granting = action === "allow-write";
+			const target = granting
+				? await controller.allowWriteHumanInitiated(rawTarget, ctx)
+				: controller.revokeWrite(rawTarget);
+			syncWriteTool();
+			saveCommandState(ctx);
+			ctx.ui.notify(granting
+				? `Unrestricted SSH access granted: ${target}. ${pi.getActiveTools().includes("ssh_exec") ? "ssh_exec enabled." : "ssh_exec is blocked by Pi tool policy."}`
+				: `Write access revoked: ${target}. Already-started remote processes may continue; changes are not undone.`, "warning");
+		} catch (err) {
+			notifyCommandError(err, ctx);
+		}
+	};
+
+	const showStatus = (ctx: ExtensionContext) => {
+		const approved = controller.approved();
+		const available = controller.availableTargets();
+		const shownAvailable = available.slice(0, MAX_DISCOVERED_TARGETS);
+		const omittedAvailable = available.length - shownAvailable.length;
+		const active = controller.activeInspectionToolNames();
+		ctx.ui.notify([
+			`SSH read-only inspection tools: ${active.length}/${controller.inspectionToolNames().length} active`,
+			`Unrestricted write targets: ${controller.writeTargets().join(", ") || "none"} (ssh_exec ${pi.getActiveTools().includes("ssh_exec") ? "active" : "inactive"})`,
+			`Session-approved targets: ${approved.length > 0 ? approved.join(", ") : "none"}`,
+			`Available exact targets (approved or whitelisted): ${shownAvailable.length > 0 ? shownAvailable.join(", ") : "none"}${omittedAvailable > 0 ? ` … (${omittedAvailable} more omitted)` : ""}`,
+		].join("\n"), "info");
+	};
+
+	const logout = (ctx: ExtensionContext) => {
+		controller.clearApprovals();
+		controller.clearCaches();
+		controller.deactivateInspectionTools();
+		syncWriteTool();
+		saveCommandState(ctx);
+		ctx.ui.notify("SSH session approvals and write grants cleared; SSH tools unloaded", "info");
+	};
+
+	const selectReadOnlyTarget = async (ctx: ExtensionContext) => {
+		if (!ctx.hasUI) {
+			ctx.ui.notify("Usage: /sshro <target> | allow-write <target> | revoke-write <target> | status | logout", "info");
+			return;
+		}
+		const choices = [...new Set([...whitelistedHosts(), ...suggestedTargets])].sort().slice(0, MAX_DISCOVERED_TARGETS);
+		if (choices.length === 0) {
+			ctx.ui.notify("No literal SSH aliases or whitelist targets were discovered. Use /sshro user@host.", "info");
+			return;
+		}
+		return ctx.ui.select("Approve an exact SSH read-only target", choices);
+	};
+
+	const approveReadOnlyTarget = (value: string, ctx: ExtensionContext) => {
+		try {
+			const target = controller.approveHumanInitiated(value);
+			const activation = controller.activateInspectionTools();
+			saveCommandState(ctx);
+			ctx.ui.notify(`SSH read-only target approved: ${target}\n${activationSummary(activation)}`, activation.blocked.length > 0 ? "warning" : "info");
+		} catch (err) {
+			notifyCommandError(err, ctx);
+		}
+	};
+
 	pi.registerCommand("sshro", {
 		description: "Approve a read-only target, allow-write/revoke-write <target>, status, or logout",
 		getArgumentCompletions: (prefix) => {
@@ -928,70 +1001,23 @@ export default function sshReadonlyExtension(pi: ExtensionAPI, options: SshReado
 			let value = (args ?? "").trim();
 			const writeCommand = /^(allow-write|revoke-write)(?:\s+(.*))?$/.exec(value);
 			if (writeCommand) {
-				try {
-					if (!writeCommand[2]) throw new Error(`Usage: /sshro ${writeCommand[1]} <target>`);
-					const granting = writeCommand[1] === "allow-write";
-					const target = granting
-						? await controller.allowWriteHumanInitiated(writeCommand[2], ctx)
-						: controller.revokeWrite(writeCommand[2]);
-					syncWriteTool();
-					persistState();
-					updateStatus(controller, ctx);
-					ctx.ui.notify(granting
-						? `Unrestricted SSH access granted: ${target}. ${pi.getActiveTools().includes("ssh_exec") ? "ssh_exec enabled." : "ssh_exec is blocked by Pi tool policy."}`
-						: `Write access revoked: ${target}. Already-started remote processes may continue; changes are not undone.`, "warning");
-				} catch (err) {
-					ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
-				}
+				await changeWriteAccess(writeCommand[1], writeCommand[2], ctx);
 				return;
 			}
 			if (value === "status") {
-				const approved = controller.approved();
-				const available = controller.availableTargets();
-				const shownAvailable = available.slice(0, MAX_DISCOVERED_TARGETS);
-				const omittedAvailable = available.length - shownAvailable.length;
-				const active = controller.activeInspectionToolNames();
-				ctx.ui.notify([
-					`SSH read-only inspection tools: ${active.length}/${controller.inspectionToolNames().length} active`,
-					`Unrestricted write targets: ${controller.writeTargets().join(", ") || "none"} (ssh_exec ${pi.getActiveTools().includes("ssh_exec") ? "active" : "inactive"})`,
-					`Session-approved targets: ${approved.length > 0 ? approved.join(", ") : "none"}`,
-					`Available exact targets (approved or whitelisted): ${shownAvailable.length > 0 ? shownAvailable.join(", ") : "none"}${omittedAvailable > 0 ? ` … (${omittedAvailable} more omitted)` : ""}`,
-				].join("\n"), "info");
+				showStatus(ctx);
 				return;
 			}
 			if (value === "logout") {
-				controller.clearApprovals();
-				controller.clearCaches();
-				controller.deactivateInspectionTools();
-				syncWriteTool();
-				persistState();
-				updateStatus(controller, ctx);
-				ctx.ui.notify("SSH session approvals and write grants cleared; SSH tools unloaded", "info");
+				logout(ctx);
 				return;
 			}
 			if (!value) {
-				if (!ctx.hasUI) {
-					ctx.ui.notify("Usage: /sshro <target> | allow-write <target> | revoke-write <target> | status | logout", "info");
-					return;
-				}
-				const choices = [...new Set([...whitelistedHosts(), ...suggestedTargets])].sort().slice(0, MAX_DISCOVERED_TARGETS);
-				if (choices.length === 0) {
-					ctx.ui.notify("No literal SSH aliases or whitelist targets were discovered. Use /sshro user@host.", "info");
-					return;
-				}
-				const selected = await ctx.ui.select("Approve an exact SSH read-only target", choices);
+				const selected = await selectReadOnlyTarget(ctx);
 				if (!selected) return;
 				value = selected;
 			}
-			try {
-				const target = controller.approveHumanInitiated(value);
-				const activation = controller.activateInspectionTools();
-				persistState();
-				updateStatus(controller, ctx);
-				ctx.ui.notify(`SSH read-only target approved: ${target}\n${activationSummary(activation)}`, activation.blocked.length > 0 ? "warning" : "info");
-			} catch (err) {
-				ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
-			}
+			approveReadOnlyTarget(value, ctx);
 		},
 	});
 
