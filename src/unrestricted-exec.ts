@@ -42,7 +42,7 @@ export function registerUnrestrictedExec(pi: ExtensionAPI, controller: SshRoCont
 	pi.on("before_agent_start", () => {
 		const targets = controller.writeTargets();
 		if (targets.length === 0) return;
-		return { message: { customType: "sshro-write-access", content: `Current session unrestricted SSH grants (use ssh_exec with the exact target): ${targets.join(", ")}. All sshro_* tools remain read-only.`, display: false } };
+		return { message: { customType: "sshro-write-access", content: `You now have unrestricted SSH access for this session to: ${targets.join(", ")}. Use ssh_exec with these exact targets for commands requiring unrestricted access; no further SSH access approval is needed. Prefer sshro_* for supported read-only inspection. All sshro_* tools remain read-only.`, display: false } };
 	});
 
 	return () => {
