@@ -21,7 +21,7 @@ const SSH_ENV_RE = /\bRSYNC_RSH\s*=/i;
  */
 export function bashSshBlockReason(command: string): string | undefined {
 	if (SSH_COMMAND_RE.test(command) || SHELL_C_SSH_RE.test(command)) {
-		return "The pi-ssh-readonly extension blocks agent bash from directly invoking SSH client commands. Use the stateless sshro_* tools with an explicit target, or user-run ! commands instead.";
+		return "The pi-ssh-readonly extension blocks agent bash from directly invoking SSH client commands. Use sshro_* for supported read-only inspection with an explicit target. For one human-reviewed operation or interactive authentication, use stage_command if available; otherwise ask the user to run it. Use ssh_exec only for an exact target already granted unrestricted access by the human. Do not seek a broad grant just to avoid individual approvals.";
 	}
 	if (SSH_ENV_RE.test(command)) {
 		return "The pi-ssh-readonly extension blocks agent bash from configuring rsync SSH transport environment variables.";

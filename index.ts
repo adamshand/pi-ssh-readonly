@@ -290,6 +290,7 @@ function registerSshRoTools(pi: ExtensionAPI, controller: SshRoController, sshEx
 		promptSnippet: "sshro_connect: Approve or discover exact SSH targets and load detailed read-only SSH inspection tools on demand.",
 		promptGuidelines: [
 			"Use sshro_connect when remote server inspection would help and either the exact target or detailed sshro_* tools are not yet available; pass a target to request approval, or omit it to discover pre-approved targets.",
+			"Prefer sshro_* for supported read-only inspection. For one human-reviewed operation, unsupported query or interactive sudo, use stage_command if available; otherwise ask the user to run it. Explain protected reads rather than silently bypassing restrictions. Use ssh_exec only with an explicit human unrestricted grant; never seek a broad grant merely to avoid per-operation approval. Read-only approval and staged execution do not grant unrestricted access.",
 		],
 		parameters: Type.Object({
 			target: Type.Optional(targetParam()),

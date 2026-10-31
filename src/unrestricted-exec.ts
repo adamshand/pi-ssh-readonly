@@ -11,7 +11,7 @@ export function registerUnrestrictedExec(pi: ExtensionAPI, controller: SshRoCont
 	pi.registerTool({
 		name: "ssh_exec",
 		label: "SSH unrestricted execution",
-		description: "Execute arbitrary POSIX shell commands on an exact target granted write access by the human via /sshro allow-write. No read-only path restrictions or secret redaction. Unapproved targets fail without prompting. Non-interactive; commands start in the remote login directory. Output is bounded to 2,000 lines/50KB. Revocation, cancellation and timeout do not undo changes or guarantee remote processes stop.",
+		description: "Execute arbitrary POSIX shell commands on an exact target granted write access by the human via /sshro allow-write. No read-only path restrictions or secret redaction. Unapproved targets fail without prompting. Prefer sshro_* for supported inspection. For one human-reviewed operation or interactive authentication, use stage_command if available; do not request a broad grant merely to avoid individual approvals. Non-interactive; commands start in the remote login directory. Output is bounded to 2,000 lines/50KB. Revocation, cancellation and timeout do not undo changes or guarantee remote processes stop.",
 		parameters: Type.Object({
 			target: Type.String({ description: "Exact target string granted by the human; aliases and other users are separate targets." }),
 			command: Type.String({ minLength: 1, description: "Arbitrary remote POSIX shell script. Use heredocs to write files; no interactive stdin or TTY." }),

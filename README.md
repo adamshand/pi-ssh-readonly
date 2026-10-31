@@ -105,6 +105,14 @@ Whenever this extension is loaded, agent-initiated `bash` tool calls are blocked
 
 Git-over-SSH is intentionally allowed, including explicit `git@host:path` and `ssh://` remote URLs and the standard `GIT_SSH` / `GIT_SSH_COMMAND` environment variables. This permits normal clone, fetch, pull, and push workflows; **pushes can modify a remote repository**. The bash guard is only a best-effort tripwire against accidental direct SSH use—not a process or network sandbox. Indirect SSH execution and non-SSH network tools remain possible. For an actual security boundary, run agent-controlled local tools in a sandbox such as Gondolin while leaving the fixed `sshro_*` tools and SSH credentials in the trusted host process.
 
+## Choosing an execution path
+
+- Use `sshro_*` for supported read-only inspection after exact-target approval.
+- If another extension provides `stage_command`, use it for one human-reviewed script, an unsupported query, or interactive sudo/authentication. Otherwise ask the user to run the operation. Explain sensitive/protected reads rather than silently working around inspection restrictions.
+- Use `ssh_exec` only for targets explicitly granted unrestricted execution by the human. Do not request a broad grant merely to avoid approving individual operations.
+
+These are separate permission scopes: read-only target approval and running a staged script do not create an unrestricted grant. Staging is optional and is not implemented or required by this package.
+
 ## Session-only unrestricted access
 
 For a staging or other trusted server that the agent needs to configure, run:
